@@ -193,6 +193,10 @@ class LatentState:
         clean_latent: Initial state of the latent before denoising, may include conditioning latents.
         attention_mask: Optional 2D self-attention mask of shape (B, T, T). Values in [0, 1] where 1 = full attention,
             0 = no attention. None means full attention everywhere. Built incrementally by conditioning items.
+        cross_attention_mask: Optional AV cross-attention mask, shape (B, T_q, T_k) with values in
+            [0, 1] (1 = attend, 0 = mask). ``T_q`` is this modality's token count and ``T_k`` the
+            *other* modality's. None (default) leaves cross-attention full bidirectional. Only set by
+            the streaming causal driver (``--causal-cross-attn``); unused by production pipelines.
     """
 
     latent: torch.Tensor
@@ -200,6 +204,7 @@ class LatentState:
     positions: torch.Tensor
     clean_latent: torch.Tensor
     attention_mask: torch.Tensor | None = None
+    cross_attention_mask: torch.Tensor | None = None
 
     def clone(self) -> "LatentState":
         return LatentState(
@@ -208,4 +213,7 @@ class LatentState:
             positions=self.positions.clone(),
             clean_latent=self.clean_latent.clone(),
             attention_mask=self.attention_mask.clone() if self.attention_mask is not None else None,
+            cross_attention_mask=self.cross_attention_mask.clone()
+            if self.cross_attention_mask is not None
+            else None,
         )

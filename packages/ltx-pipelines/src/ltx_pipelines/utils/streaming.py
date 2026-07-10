@@ -86,6 +86,47 @@ def log_bias_from_binary_mask(mask: torch.Tensor, dtype: torch.dtype) -> torch.T
     return ((1.0 - mask).to(dtype)) * torch.finfo(dtype).min
 
 
+def cross_causal_attention_mask(
+    video_positions: torch.Tensor,
+    audio_positions: torch.Tensor,
+    lookahead_sec: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Time-causal AV cross-attention masks from LTX-2's shared seconds-axis positions.
+
+    LTX-2 builds cross-attention RoPE from ``positions[:, 0:1, :]`` for *both*
+    modalities (``MultiModalTransformerArgsPreprocessor.prepare``): the temporal
+    dim, evaluated at the middle of each patch's ``[start, end)`` bounds. Video's
+    temporal dim is ``frame_index / fps`` and audio's is the spectrogram
+    timestamp — **both in seconds** — so the two are directly comparable on one
+    time axis (Vidu S1 §2.3 "causal attention mask on video-audio tokens"). The
+    streaming driver builds both states window-relative, so they share an origin.
+
+    Returns ``(a2v, v2a)`` as ``[0, 1]`` float masks (``1`` = attend):
+
+    * ``a2v`` ``(B, T_v, T_a)`` — video query, audio key. Allow audio frame ``j``
+      iff its start is within or before the video frame's end:
+      ``audio_start_j <= video_end_i + lookahead``.
+    * ``v2a`` ``(B, T_a, T_v)`` — audio query, video key (the transpose with the
+      same lookahead): ``video_start_j <= audio_end_i + lookahead``.
+
+    Using ``[start, end)`` bounds (not frame centers) avoids a video frame
+    missing audio frames that lie within its own span. ``lookahead_sec=0`` is
+    strict causal (paper-faithful: "conditions available up to frame i"); a small
+    positive lookahead lets a video frame peek slightly into future audio (useful
+    for lip-sync on a bidirectionally-trained model).
+    """
+    # temporal [start, end) per token, in seconds (dim 0 of the position grid).
+    v_start = video_positions[:, 0, :, 0]  # (B, T_v)
+    v_end = video_positions[:, 0, :, 1]  # (B, T_v)
+    a_start = audio_positions[:, 0, :, 0]  # (B, T_a)
+    a_end = audio_positions[:, 0, :, 1]  # (B, T_a)
+    # a2v: query=video (T_v), key=audio (T_a). [i, j] = a_start[j] <= v_end[i] + la.
+    a2v = (a_start[:, None, :] <= v_end[:, :, None] + lookahead_sec).to(torch.float32)
+    # v2a: query=audio (T_a), key=video (T_v). [i, j] = v_start[j] <= a_end[i] + la.
+    v2a = (v_start[:, None, :] <= a_end[:, :, None] + lookahead_sec).to(torch.float32)
+    return a2v, v2a
+
+
 @dataclass
 class ChunkSnapshots:
     """TwinCache snapshots for one finalized AR chunk (patchified tokens).
@@ -314,6 +355,8 @@ def streaming_generate(  # noqa: PLR0913, PLR0915
     noiser: Noiser,
     dtype: torch.dtype,
     device: torch.device,
+    causal_cross_attn: bool = True,
+    cross_attn_lookahead_sec: float = 0.0,
 ) -> torch.Tensor:
     """Autoregressive streaming A2V generation (returns the full video latent).
 
@@ -326,6 +369,11 @@ def streaming_generate(  # noqa: PLR0913, PLR0915
     the history snapshot noisy↔clean per step and captures the current chunk's
     noisy mid-snapshot); finalize the chunk's snapshots; splice the chunk's
     clean latent into the full video latent.
+
+    When ``causal_cross_attn`` is set, a time-causal mask is also applied to the
+    AV cross-attention (a2v: video→audio, v2a: audio→video) via
+    :func:`cross_causal_attention_mask`, built from the same window-relative
+    seconds-axis positions LTX-2 uses for cross-attn RoPE.
 
     Per Vidu S1 §2.3.1, the persistent reference context is the sink (encoded
     first-frame latent) plus the *first generated chunk* (always injected
@@ -403,6 +451,13 @@ def streaming_generate(  # noqa: PLR0913, PLR0915
             device=device,
             dtype=dtype,
         )
+
+        if causal_cross_attn:
+            a2v_mask, v2a_mask = cross_causal_attention_mask(
+                window_state.positions, audio_state.positions, cross_attn_lookahead_sec
+            )
+            window_state = replace(window_state, cross_attention_mask=a2v_mask)
+            audio_state = replace(audio_state, cross_attention_mask=v2a_mask)
 
         denoiser = StreamingTwinDenoiser(
             v_context=v_context,
@@ -519,6 +574,8 @@ def streaming_generate_cached(  # noqa: PLR0913, PLR0915
     noiser: Noiser,
     dtype: torch.dtype,
     device: torch.device,
+    causal_cross_attn: bool = True,
+    cross_attn_lookahead_sec: float = 0.0,
 ) -> torch.Tensor:
     """M2: KV-cache + RoPE repositioning streaming generation.
 
@@ -631,6 +688,17 @@ def streaming_generate_cached(  # noqa: PLR0913, PLR0915
                 clean_latent=mod_clean,
                 attention_mask=None,  # cached attn1 uses query_mask via the cache
             )
+
+            if causal_cross_attn:
+                # Cross-attn is NOT cached (only video self-attn attn1 is), so the
+                # time-causal mask applies normally through the modality. Constant
+                # across denoising steps (positions don't change) -> set once per
+                # chunk; the step loop's replace(video_state, latent=...) preserves it.
+                a2v_mask, v2a_mask = cross_causal_attention_mask(
+                    video_state.positions, audio_state.positions, cross_attn_lookahead_sec
+                )
+                video_state = replace(video_state, cross_attention_mask=a2v_mask)
+                audio_state = replace(audio_state, cross_attention_mask=v2a_mask)
 
             wrapper.prepare_chunk(window_pe=window_pe, query_mask=query_mask, hist_len=hist_t)
 

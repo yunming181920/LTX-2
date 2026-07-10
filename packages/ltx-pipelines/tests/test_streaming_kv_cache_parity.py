@@ -86,6 +86,9 @@ def _run_both(pipeline, common_static, *, num_frames, frame_rate, chunk_frames, 
         stepper=EulerDiffusionStep(),
         dtype=torch.bfloat16,
         device=device,
+        # Isolate the KV-cache comparison: disable the (default-ON) causal
+        # cross-attention so this test measures M2-vs-M1 KV-cache parity only.
+        causal_cross_attn=False,
     )
 
     with pipeline.stage.model_context() as transformer:

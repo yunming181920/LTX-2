@@ -26,6 +26,27 @@ from ltx_core.model.transformer.rope import LTXRopeType
 from ltx_core.model.transformer.transformer_args import TransformerArgs
 
 
+def _assert_cross_mask_shape(
+    mask: torch.Tensor | None, query_tokens: int, context_tokens: int, name: str
+) -> None:
+    """Validate an AV cross-attention mask against the query/context token counts.
+
+    The streaming causal driver builds the mask from the same window positions
+    that produce the query/context tokens, so a mismatch means the window layout
+    and the mask went out of sync — fail loudly rather than silently dropping
+    causality (a wrong-shape mask would otherwise raise a cryptic SDPA error or,
+    worse, broadcast incorrectly). No-op when the mask is None (full attention).
+    """
+    if mask is None:
+        return
+    if mask.shape[-2] != query_tokens or mask.shape[-1] != context_tokens:
+        raise RuntimeError(
+            f"{name}: cross-attention mask shape {tuple(mask.shape)} incompatible with "
+            f"query={query_tokens} / context={context_tokens} tokens. The streaming driver's "
+            f"window layout and the mask are out of sync."
+        )
+
+
 @dataclass
 class TransformerConfig:
     dim: int
@@ -351,12 +372,16 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 )
                 a2v_ax_scaled = self.ada_zero_function(ax_pre_av, self.norm_eps, scale_ca_audio_a2v, shift_ca_audio_a2v)
                 del scale_ca_audio_a2v, shift_ca_audio_a2v
+                _assert_cross_mask_shape(
+                    video.cross_attention_mask, a2v_vx_scaled.shape[1], a2v_ax_scaled.shape[1], "a2v"
+                )
                 vx = vx + (
                     self.audio_to_video_attn(
                         a2v_vx_scaled,
                         context=a2v_ax_scaled,
                         pe=video.cross_positional_embeddings,
                         k_pe=audio.cross_positional_embeddings,
+                        mask=video.cross_attention_mask,
                     )
                     * gate_out_a2v
                     * video.cross_attn_perturbation_mask
@@ -382,12 +407,16 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 )
                 v2a_vx_scaled = self.ada_zero_function(vx_pre_av, self.norm_eps, scale_ca_video_v2a, shift_ca_video_v2a)
                 del scale_ca_video_v2a, shift_ca_video_v2a
+                _assert_cross_mask_shape(
+                    audio.cross_attention_mask, v2a_ax_scaled.shape[1], v2a_vx_scaled.shape[1], "v2a"
+                )
                 ax = ax + (
                     self.video_to_audio_attn(
                         v2a_ax_scaled,
                         context=v2a_vx_scaled,
                         pe=audio.cross_positional_embeddings,
                         k_pe=video.cross_positional_embeddings,
+                        mask=audio.cross_attention_mask,
                     )
                     * gate_out_v2a
                     * audio.cross_attn_perturbation_mask

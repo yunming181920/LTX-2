@@ -269,6 +269,7 @@ def modality_from_latent_state(
         context=context,
         context_mask=None,
         attention_mask=state.attention_mask,
+        cross_attention_mask=state.cross_attention_mask,
     )
 
 

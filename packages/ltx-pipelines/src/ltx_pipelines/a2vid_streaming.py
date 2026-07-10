@@ -18,6 +18,7 @@ for IO, ``VideoDecoder`` for output, and the streaming primitives in
 :mod:`ltx_pipelines.utils.streaming`.
 """
 
+import argparse
 import logging
 import math
 from collections.abc import Iterator
@@ -141,6 +142,8 @@ class A2VidStreamingPipeline:
         chunk_frames: int = 1,
         audio_lookahead: int | None = None,
         use_kv_cache: bool = False,
+        causal_cross_attn: bool = True,
+        cross_attn_lookahead_sec: float = 0.0,
         tiling_config: TilingConfig | None = None,
         enhance_prompt: bool = False,
         sigmas: torch.Tensor | None = None,
@@ -230,6 +233,8 @@ class A2VidStreamingPipeline:
                     noiser=noiser,
                     dtype=dtype,
                     device=self.device,
+                    causal_cross_attn=causal_cross_attn,
+                    cross_attn_lookahead_sec=cross_attn_lookahead_sec,
                 )
             else:
                 full_latent = streaming_generate(
@@ -248,6 +253,8 @@ class A2VidStreamingPipeline:
                     noiser=noiser,
                     dtype=dtype,
                     device=self.device,
+                    causal_cross_attn=causal_cross_attn,
+                    cross_attn_lookahead_sec=cross_attn_lookahead_sec,
                 )
 
         decoded_video = self.video_decoder(full_latent, tiling_config, generator=generator)
@@ -308,6 +315,29 @@ def main() -> None:
         "results differ slightly from the default full-recompute path — run the "
         "parity/smoke test before trusting). Default off (M1 latent-level TwinCache).",
     )
+    parser.add_argument(
+        "--causal-cross-attn",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Apply a time-causal mask to the AV cross-attention (a2v video->audio and "
+        "v2a audio->video), per Vidu S1 §2.3 'causal attention mask on video-audio "
+        "tokens'. The mask is built from LTX-2's shared seconds-axis cross-attn RoPE "
+        "positions, so video frame i only attends audio up to its own time. Default ON "
+        "for paper-faithful streaming causality — the base LTX-2 model is bidirectionally "
+        "trained, so this is a train/test mismatch (this is a conceptual reproduction, not "
+        "tuned for runtime quality); pass --no-causal-cross-attn to revert to full "
+        "bidirectional cross-attention.",
+    )
+    parser.add_argument(
+        "--cross-attn-lookahead-seconds",
+        type=float,
+        default=0.0,
+        help="Seconds of future audio a video frame may attend to under --causal-cross-attn "
+        "(0.0 = strict causal, paper-faithful 'conditions up to frame i'). A small positive "
+        "value (e.g. one video frame = 8/fps) can mitigate lip-sync regression on the "
+        "bidirectionally-trained base model. Independent of --audio-lookahead (which "
+        "controls how much future audio is in the slice at all).",
+    )
     args = parser.parse_args()
 
     pipeline = A2VidStreamingPipeline(
@@ -337,6 +367,8 @@ def main() -> None:
         chunk_frames=args.chunk_frames,
         audio_lookahead=args.audio_lookahead,
         use_kv_cache=args.use_kv_cache,
+        causal_cross_attn=args.causal_cross_attn,
+        cross_attn_lookahead_sec=args.cross_attn_lookahead_seconds,
         tiling_config=tiling_config,
         enhance_prompt=args.enhance_prompt,
     )

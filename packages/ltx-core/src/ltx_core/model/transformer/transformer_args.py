@@ -29,6 +29,10 @@ class TransformerArgs:
     self_attention_mask: torch.Tensor | None = (
         None  # Additive log-space self-attention bias (B, 1, T, T), None = full attention
     )
+    # Additive log-space AV cross-attention bias (B, 1, T_q, T_k) for this modality
+    # attending the *other* modality; None = full bidirectional cross-attention.
+    # Only populated by the streaming causal driver; None for all production pipelines.
+    cross_attention_mask: torch.Tensor | None = None
     # Per-block perturbation state, precomputed by `LTXModel._process_transformer_blocks`
     # so the block forward needs no per-block identity. The bool shortcuts
     # (`*_all_perturbed`, `cross_attn_skip_all`) are Python bools that Dynamo specialises
@@ -227,6 +231,9 @@ class TransformerArgsPreprocessor:
             x_dtype=modality.latent.dtype,
         )
         self_attention_mask = self._prepare_self_attention_mask(modality.attention_mask, modality.latent.dtype)
+        cross_attention_mask = self._prepare_self_attention_mask(
+            modality.cross_attention_mask, modality.latent.dtype
+        )
         return TransformerArgs(
             x=x,
             context=context,
@@ -240,6 +247,7 @@ class TransformerArgsPreprocessor:
             enabled=modality.enabled,
             prompt_timestep=prompt_timestep,
             self_attention_mask=self_attention_mask,
+            cross_attention_mask=cross_attention_mask,
         )
 
 

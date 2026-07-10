@@ -38,6 +38,11 @@ class Modality:
             attention. ``None`` means unrestricted (full) attention between
             all tokens. Built incrementally by conditioning items; see
             :class:`~ltx_core.conditioning.types.attention_strength_wrapper.ConditioningItemAttentionStrengthWrapper`.
+        cross_attention_mask: Optional AV cross-attention mask, shape
+            ``(B, T_q, T_k)`` with values in ``[0, 1]`` (``1`` = attend,
+            ``0`` = mask). ``T_q`` is this modality's token count, ``T_k`` the
+            *other* modality's. ``None`` (default) leaves cross-attention full
+            bidirectional. Only set by the streaming causal driver.
     """
 
     latent: (
@@ -53,6 +58,7 @@ class Modality:
     enabled: bool = True
     context_mask: torch.Tensor | None = None
     attention_mask: torch.Tensor | None = None
+    cross_attention_mask: torch.Tensor | None = None
 
     def split(self, sizes: list[int]) -> list[Modality]:
         """Split along the batch dimension into chunks of the given sizes."""
