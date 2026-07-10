@@ -3,12 +3,14 @@
 Training-free reproduction of Vidu S1 §2.3 streaming inference on top of the
 pretrained *bidirectional* LTX-2 checkpoint (used as-is as the "causal model").
 
-Milestone 1: causal block-causal self-attention mask + sliding-window decoding
-+ persistent reference context ("sink" = encoded first-frame latent) +
+Milestone 1: block-causal self-attention mask + sliding-window decoding +
+persistent reference context per Vidu S1 §2.3.1 (the encoded first-frame
+latent "sink" plus the first generated chunk, both fixed and never evicted) +
 latent-level TwinCache (noisy/clean history snapshots swapped per denoising
-step) + frozen audio control. Generation is streaming internally (per-step
-activation memory is O(window)); the full latent is decoded once at the end
-(causal-VAE seamless decode) and streamed out.
+step) + frozen audio control (window-aligned slice, window-relative
+positions). Generation is streaming internally (per-step activation memory is
+O(window)); the full latent is decoded once at the end (causal-VAE seamless
+decode) and streamed out.
 
 No core (ltx-core) changes; reuses ``DiffusionStage.model_context`` for the
 transformer lifecycle, ``PromptEncoder``/``ImageConditioner``/``AudioConditioner``
@@ -151,6 +153,10 @@ class A2VidStreamingPipeline:
         assert_resolution(height=height, width=width, is_two_stage=False)
         if not images:
             raise ValueError("A2VidStreamingPipeline requires a reference image (frame_idx=0) as the sink.")
+        if window_chunks < 1:
+            raise ValueError(f"window_chunks must be >= 1, got {window_chunks}")
+        if chunk_frames < 1:
+            raise ValueError(f"chunk_frames must be >= 1, got {chunk_frames}")
 
         generator = torch.Generator(device=self.device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
@@ -278,7 +284,8 @@ def main() -> None:
         "--window-chunks",
         type=int,
         default=4,
-        help="Sliding-window history size in AR chunks (TwinCache FIFO cap). Default 4.",
+        help="Sliding-window rolling-history size in AR chunks (TwinCache FIFO cap; "
+        "the sink and the first generated chunk are persistent and not counted). Default 4.",
     )
     parser.add_argument(
         "--chunk-frames",
@@ -296,8 +303,10 @@ def main() -> None:
     parser.add_argument(
         "--use-kv-cache",
         action="store_true",
-        help="Milestone 2: use the KV-cache + RoPE-repositioning path (faster, "
-        "UNTESTED — run the parity test before trusting). Default off (M1 latent-level TwinCache).",
+        help="Milestone 2: use the KV-cache + RoPE-repositioning path (faster; history "
+        "K/V are reused from each chunk's own denoising pass per Vidu S1 §2.3.1, so "
+        "results differ slightly from the default full-recompute path — run the "
+        "parity/smoke test before trusting). Default off (M1 latent-level TwinCache).",
     )
     args = parser.parse_args()
 

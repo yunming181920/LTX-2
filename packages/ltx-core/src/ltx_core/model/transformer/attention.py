@@ -603,14 +603,21 @@ class Attention(torch.nn.Module):
         ``x``/``context`` carry ``[sink (1 frame) | current chunk]`` tokens —
         the sink is recomputed each step (its K/V depend on the per-chunk audio
         slice via AV cross-attn, so it is NOT cached, matching the bidirectional
-        path). Generated *history* K/V (pre-RoPE) come from the cache and are
-        spliced between sink and current: ``k_all = [sink | history | current]``
+        path). Generated *history* K/V (pre-RoPE) come from the cache
+        (permanent first chunk + rolling TwinCache ring) and are spliced
+        between sink and current: ``k_all = [sink | first | history | current]``
         in window order, matching the full-window ``window_pe`` (RoPE
-        repositioning). The query is ``[sink | current]``; the block-causal mask
-        is the full-window mask with the history *query* rows removed (history is
-        not queried, only attended to). The current chunk's pre-RoPE K/V are
-        stashed for TwinCache snapshot capture (noisy at the mid step, clean at
-        the final step).
+        repositioning). The query is ``[sink | current]``; ``cache.query_mask``
+        is the full-window block-causal mask with the history *query* rows
+        removed (history is not queried, only attended to), already converted
+        by the driver to a **log-space additive bias** (0.0 keep / finfo.min
+        drop) so it plugs straight into the masked SDPA path. The current
+        chunk's pre-RoPE K/V are stashed for TwinCache snapshot capture (noisy
+        at the mid step, clean at the final step).
+
+        Note: this path applies ``q_norm``/``k_norm`` + RoPE explicitly
+        (equivalent to the default :class:`PytorchPreAttention`); custom
+        ``preattention_function`` overrides are not routed through here.
         """
         if all_perturbed:
             return self.to_out(self.to_v(context))
@@ -648,10 +655,20 @@ class Attention(torch.nn.Module):
         # Stash the current chunk's pre-RoPE K/V for TwinCache snapshot capture.
         cache.set_current(cur_k, cur_v)
 
-        mask = cache.query_mask  # (1, sink+cur, full) block-causal, history query rows removed
-        if mask is None or mask.shape[1] != q.shape[1] or mask.shape[-1] != k_all.shape[1]:
+        # (1, sink+cur, full) log-space additive bias, history query rows removed.
+        mask = cache.query_mask
+        if mask is None:
             out = self.attention_function(q, k_all, v_all, self.heads)
         else:
+            if mask.shape[1] != q.shape[1] or mask.shape[-1] != k_all.shape[1]:
+                # A silent fallback here would drop causality; fail loudly —
+                # this means the driver's window layout and the cache contents
+                # went out of sync (e.g. eviction bookkeeping mismatch).
+                raise RuntimeError(
+                    "StreamingKVCache query_mask shape "
+                    f"{tuple(mask.shape)} does not match q={q.shape[1]} / "
+                    f"k={k_all.shape[1]} tokens; window layout and cache are out of sync."
+                )
             out = self.masked_attention_function(q, k_all, v_all, self.heads, mask)
 
         if perturbation_mask is not None:

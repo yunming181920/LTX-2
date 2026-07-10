@@ -3,65 +3,83 @@
 A :class:`StreamingKVCache` lives on one ``Attention`` module (the video
 self-attention ``attn1`` of a single transformer block). It stores, for each
 finalized AR chunk, the chunk's **pre-RoPE** key (post ``k_norm``, pre
-``apply_rotary_emb``) and value (post ``to_v``) — *two snapshots per chunk*
-(TwinCache: ``noisy`` captured at a mid denoising step, ``clean`` captured at
-the final step). The first deque entry is the sink, added once and fixed.
+``apply_rotary_emb``) and value (post ``to_v``).
+
+Layout follows Vidu S1 §2.3.1:
+  * The *first* generated chunk is part of the persistent reference context:
+    it is committed once into the permanent ``_first`` slot (clean snapshot,
+    never evicted, read in both TwinCache modes).
+  * Every *subsequent* chunk keeps **two snapshots** (TwinCache: ``noisy``
+    captured at a mid denoising step, ``clean`` captured at the final step)
+    in a FIFO ring capped at ``window_chunks``.
 
 The cache is read by the cached attention path (see
 :func:`ltx_core.model.transformer.attention.Attention._stream_cached_forward`):
-it concatenates the history snapshots selected by the current ``mode``
-(``"noisy"`` during intermediate denoising steps, ``"clean"`` at the final
-step) with the freshly-computed current-chunk K/V, then re-applies RoPE to the
-assembled keys using the window-relative ``window_pe`` (RoPE repositioning).
+it concatenates ``_first`` and then the ring snapshots selected by the current
+``mode`` (``"noisy"`` during intermediate denoising steps, ``"clean"`` at the
+final step) with the freshly-computed current-chunk K/V, then re-applies RoPE
+to the assembled keys using the window-relative ``window_pe`` (RoPE
+repositioning).
 
-Only **video self-attention** is cached. Audio↔video cross-attention uses
-frozen audio (recomputed cheaply) and its history-side output is discarded
-(audio is frozen), so it needs no cache.
+Only **video self-attention** is cached. The sink (first-frame latent) is NOT
+cached — it lives in the modality and is recomputed each step (its K/V depend
+on the per-chunk audio slice via AV cross-attn). Audio↔video cross-attention
+uses frozen audio (recomputed cheaply), so it needs no cache.
 """
 
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+
+import torch
 
 
 @dataclass
 class _ChunkKV:
     """Pre-RoPE key + value for one chunk, in both TwinCache snapshots."""
 
-    noisy: tuple[object, object] | None = None  # (k_pre_rope, v)
-    clean: tuple[object, object] | None = None  # (k_pre_rope, v)
+    noisy: tuple[torch.Tensor, torch.Tensor] | None = None  # (k_pre_rope, v)
+    clean: tuple[torch.Tensor, torch.Tensor] | None = None  # (k_pre_rope, v)
 
 
 class StreamingKVCache:
-    """Per-Attention-module KV cache with TwinCache (noisy + clean) snapshots.
+    """Per-Attention-module KV cache with a permanent first-chunk slot and a
+    TwinCache (noisy + clean) FIFO ring for subsequent chunks.
 
     Lifecycle within one AR chunk's multi-step denoising:
-      1. ``set_active(mode, window_pe, hist_len)`` before each forward — selects
-         which snapshot history reads (``"noisy"`` mid-denoising, ``"clean"``
-         final) and provides the full-window RoPE ``window_pe`` plus the history
-         token length (sink + finalized chunks).
+      1. ``set_active(mode, window_pe, query_mask, hist_len, tokens_per_frame)``
+         before each forward — selects which snapshot the ring reads
+         (``"noisy"`` mid-denoising, ``"clean"`` final) and provides the
+         full-window RoPE ``window_pe`` plus the log-space additive
+         ``query_mask`` and history token length.
       2. The cached attention path calls :meth:`read` for history K/V and
          :meth:`set_current` to stash the freshly-computed current-chunk K/V.
       3. At the mid step the driver calls :meth:`stash` (``"noisy"``); at the
-         final step :meth:`stash` (``"clean"``) then :meth:`commit` to append the
-         finalized chunk's TwinCache entry to the FIFO ring.
+         final step :meth:`stash` (``"clean"``) then :meth:`commit`. The first
+         commit fills the permanent slot; later commits append to the ring.
     """
 
     def __init__(self, window_chunks: int) -> None:
-        # +1 slot for the sink (permanent head); history chunks cap at window_chunks.
-        self._entries: deque[_ChunkKV] = deque(maxlen=window_chunks + 1)
+        if window_chunks < 1:
+            raise ValueError(f"window_chunks must be >= 1, got {window_chunks}")
+        # Persistent reference (first generated chunk, clean, never evicted).
+        self._first: tuple[torch.Tensor, torch.Tensor] | None = None
+        # Rolling history of subsequent chunks (TwinCache entries).
+        self._entries: deque[_ChunkKV] = deque(maxlen=window_chunks)
         self._pending: _ChunkKV = _ChunkKV()
         # Runtime state, set per forward by the driver via set_active(...).
         self.active: bool = False
         self.mode: str | None = None  # "noisy" | "clean"
-        self.window_pe: tuple[object, object] | None = None  # full-window (cos, sin) [sink|hist|cur]
-        self.query_mask: object | None = None  # (1, sink+cur, full) block-causal, hist query rows removed
+        self.window_pe: tuple[torch.Tensor, torch.Tensor] | None = None  # (cos, sin) [sink|first|hist|cur]
+        # (1, sink+cur, full) log-space additive bias (0.0 keep / finfo.min drop),
+        # block-causal with history query rows removed.
+        self.query_mask: torch.Tensor | None = None
         self.tokens_per_frame: int = 0  # sink token count (1 latent frame)
-        self.hist_len: int = 0  # cached history token count (finalized chunks)
+        self.hist_len: int = 0  # cached history token count (first + ring)
         # Current-chunk pre-RoPE K/V (stashed by the attention path each forward).
-        self._cur_k = None
-        self._cur_v = None
+        self._cur_k: torch.Tensor | None = None
+        self._cur_v: torch.Tensor | None = None
 
     # -- driver control ----------------------------------------------------------
     def set_active(
@@ -77,25 +95,23 @@ class StreamingKVCache:
     def set_inactive(self) -> None:
         self.active = False
 
-    def read(self):
-        """Concatenate history K/V (pre-RoPE) for the current ``mode`` snapshot.
+    def read(self) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Concatenate history K/V (pre-RoPE): permanent first chunk, then the
+        ring snapshots for the current ``mode``.
 
-        Returns ``(k_hist, v_hist)`` along the token dim, or ``(None, None)`` if
-        no history is cached yet (the first AR chunk has no generated history).
-        The sink is NOT cached — it lives in the modality and is recomputed each
-        step (its K/V depend on the per-chunk audio slice).
+        Returns ``(k_hist, v_hist)`` along the token dim, or ``(None, None)``
+        if no history is cached yet (the first AR chunk has no history).
         """
-        if not self._entries:
-            return None, None
-        import torch
-
-        ks = []
-        vs = []
+        ks: list[torch.Tensor] = []
+        vs: list[torch.Tensor] = []
+        if self._first is not None:
+            ks.append(self._first[0])
+            vs.append(self._first[1])
         for entry in self._entries:
             kv = entry.noisy if self.mode == "noisy" else entry.clean
             if kv is None:
-                # Snapshot not yet captured for this entry (e.g. mid-step before
-                # any chunk finalized): fall back to whichever exists.
+                # Snapshot not captured for this entry (e.g. single-step
+                # schedules): fall back to whichever exists.
                 kv = entry.clean or entry.noisy
             if kv is None:
                 continue
@@ -103,9 +119,11 @@ class StreamingKVCache:
             vs.append(kv[1])
         if not ks:
             return None, None
+        if len(ks) == 1:
+            return ks[0], vs[0]
         return torch.cat(ks, dim=1), torch.cat(vs, dim=1)
 
-    def set_current(self, k_pre_rope, v) -> None:
+    def set_current(self, k_pre_rope: torch.Tensor, v: torch.Tensor) -> None:
         """Stash the current chunk's pre-RoPE K/V (for snapshot capture)."""
         self._cur_k = k_pre_rope
         self._cur_v = v
@@ -121,18 +139,28 @@ class StreamingKVCache:
             self._pending.clean = kv
 
     def commit(self) -> None:
-        """Append the pending TwinCache entry to the FIFO ring and reset."""
+        """Finalize the pending chunk.
+
+        The first committed chunk becomes the permanent reference slot (clean
+        snapshot; Vidu S1's persistent reference context). Subsequent chunks
+        are appended to the FIFO ring as TwinCache entries.
+        """
         if self._pending.noisy is None or self._pending.clean is None:
             # Need both snapshots; if one is missing, duplicate the other.
             kv = self._pending.clean or self._pending.noisy
             self._pending = _ChunkKV(noisy=kv, clean=kv)
-        self._entries.append(self._pending)
+        if self._first is None:
+            # Persistent reference: always the clean snapshot.
+            self._first = self._pending.clean
+        else:
+            self._entries.append(self._pending)
         self._pending = _ChunkKV()
         self._cur_k = None
         self._cur_v = None
         self.hist_len = self._token_len()
 
     def reset(self) -> None:
+        self._first = None
         self._entries.clear()
         self._pending = _ChunkKV()
         self._cur_k = None
@@ -146,8 +174,10 @@ class StreamingKVCache:
 
     # -- helpers ----------------------------------------------------------------
     def _token_len(self) -> int:
-        """Total token count of all cached history entries."""
+        """Total token count of all cached history entries (first + ring)."""
         total = 0
+        if self._first is not None:
+            total += self._first[0].shape[1]
         for entry in self._entries:
             kv = entry.clean or entry.noisy
             if kv is not None:

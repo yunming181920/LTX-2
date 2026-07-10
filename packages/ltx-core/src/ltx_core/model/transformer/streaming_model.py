@@ -8,14 +8,17 @@ bidirectional pipelines untouched (their ``attn1.stream_cache`` stays ``None``).
 
 The driver (``ltx_pipelines.utils.streaming``) calls:
   * :meth:`prepare_chunk` once per AR chunk with the full-window RoPE
-    ``window_pe`` ([sink|history|current]) and the block-causal ``query_mask``
-    (history query rows removed), the history token length;
+    ``window_pe`` ([sink|first|history|current]) and the block-causal
+    ``query_mask`` — a **log-space additive bias** (0.0 keep / finfo.min
+    drop) with the history query rows removed — plus the history token length;
   * :meth:`set_mode` per denoising step (``"noisy"`` mid-denoising,
-    ``"clean"`` at the final step) — selects which TwinCache snapshot history
-    reads;
+    ``"clean"`` at the final step) — selects which TwinCache snapshot the
+    rolling history reads (the permanent first-chunk slot always reads clean);
   * :meth:`stash` at the mid step (``"noisy"``) and final step (``"clean"``),
-    then :meth:`commit` to append the chunk's TwinCache K/V entry to every
-    cache's FIFO ring.
+    then :meth:`commit` to finalize the chunk in every cache (first chunk →
+    permanent reference slot, later chunks → FIFO ring);
+  * :meth:`detach` when streaming ends, to remove the caches from the wrapped
+    model's attention modules (restores the production forward path).
 
 The query RoPE uses the modality's own ``[sink|current]`` pe (passed to
 ``attn1`` as ``video.positional_embeddings``); only the key RoPE uses the
@@ -60,6 +63,16 @@ class CausalStreamingModel(torch.nn.Module):
         self._window_pe = None
         self._query_mask = None
         self._hist_len = 0
+
+    def detach(self) -> None:
+        """Reset and remove the caches from the wrapped model's attn modules.
+
+        After this, the wrapped ``X0Model`` is byte-identical to its
+        pre-wrapping state (``attn1.stream_cache is None`` -> standard path).
+        """
+        self.reset()
+        for blk in self.x0.velocity_model.transformer_blocks:
+            blk.attn1.stream_cache = None
 
     def prepare_chunk(self, *, window_pe, query_mask, hist_len: int) -> None:
         """Set per-AR-chunk RoPE/mask params (held until the next chunk)."""
