@@ -7,15 +7,19 @@ Milestone 1 = correct-but-slow, NO core changes, NO KV cache:
   * block-causal self-attention mask on the temporal axis (routed through the
     existing ``Modality.attention_mask`` → ``TransformerArgs.self_attention_mask``
     channel — no DiT changes),
-  * sliding-window decoding with a persistent reference context ("sink" = the
-    encoded first-frame latent, fixed at window-relative frame 0),
-  * latent-level TwinCache: each finalized history chunk stores a *noisy*
+  * sliding-window decoding with a persistent reference context per Vidu S1
+    §2.3.1: the encoded first-frame latent ("sink", fixed at window-relative
+    frame 0) **plus the first generated chunk** (fixed right after the sink,
+    always injected clean, never evicted),
+  * latent-level TwinCache: each finalized *subsequent* chunk stores a *noisy*
     snapshot (captured at a mid denoising step) and a *clean* snapshot (the
     final latent); intermediate denoising steps of the current chunk read the
     *noisy* history, the final step reads the *clean* history,
   * per-token ``denoise_mask`` keeps sink+history frozen (velocity == 0 under
     the Euler step) while the current chunk is denoised,
-  * audio is a frozen control signal (growing time-aligned slice per AR step).
+  * audio is a frozen control signal, sliced to the sliding window's time span
+    with window-relative positions so audio↔video cross-attn RoPE stays
+    aligned after the window starts sliding (and per-step cost stays O(window)).
 
 The AR unit is one latent video frame (= 8 pixel frames = ``H_lat * W_lat``
 tokens); ``chunk_frames`` may generate a few latent frames per step.
@@ -29,6 +33,7 @@ window-relative RoPE positions for free) + ``VideoDecoder``.
 from __future__ import annotations
 
 import logging
+import math
 from collections import deque
 from dataclasses import dataclass, replace
 
@@ -68,6 +73,17 @@ def block_causal_attention_mask(frame_indices: torch.Tensor) -> torch.Tensor:
     # (T, 1) <= (1, T) -> (T, T); key frame <= query frame.
     mask = (fi.unsqueeze(1) >= fi.unsqueeze(0)).to(torch.float32)
     return mask.unsqueeze(0)  # (1, T, T)
+
+
+def log_bias_from_binary_mask(mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Convert a binary ``[0, 1]`` attention mask to a log-space additive bias.
+
+    ``1 -> 0.0`` (keep) and ``0 -> finfo(dtype).min`` (drop) — the same
+    semantics the core preprocessor applies to ``Modality.attention_mask``
+    (``TransformerArgsPreprocessor._prepare_self_attention_mask``), for masks
+    that bypass that channel (the Milestone 2 cached-attention ``query_mask``).
+    """
+    return ((1.0 - mask).to(dtype)) * torch.finfo(dtype).min
 
 
 @dataclass
@@ -193,21 +209,35 @@ def assemble_audio_slice(
     frames_through_chunk: int,
     fps: float,
     audio_lookahead: int,
+    window_start_offset_frames: int = 0,
 ) -> torch.Tensor:
-    """Time-aligned frozen audio latent slice for the AR chunk that has
-    produced ``frames_through_chunk`` latent video frames so far.
+    """Time-aligned frozen audio latent slice for the current sliding window.
 
-    The slice covers audio latent frames from 0 up to the end of the current
-    chunk's video time span plus ``audio_lookahead`` audio frames (so the model
-    sees the audio aligned to the frame it is generating). Audio latent runs at
-    25 frames/sec; video latent at ``fps / 8`` frames/sec. Frame 0 is the sink,
-    so generated video latent frames start at index 1.
+    ``frames_through_chunk`` is the number of generated latent video frames
+    through the end of the current chunk (frame 0 is the sink, so generated
+    frames start at real latent index 1). ``window_start_offset_frames`` is
+    the number of *evicted* latent video frames that precede the window's
+    rolling history — i.e. the real latent frame index of the window's first
+    rolling-history frame minus the window position it occupies. It is 0 until
+    the window starts sliding.
+
+    The slice starts at the audio latent frame corresponding to the window's
+    start and ends at the current chunk's video end plus ``audio_lookahead``
+    audio frames. Building the audio state from this slice with fresh
+    zero-based positions makes the audio positions *window-relative*, matching
+    the video window's repositioned RoPE (Vidu S1 §2.3.1 RoPE repositioning
+    applied to both modalities), and keeps the per-step audio cost O(window).
+
+    Audio latent runs at 25 frames/sec; video latent at ``fps / 8`` frames/sec.
     """
-    current_end_latent_frame = 1 + frames_through_chunk
-    current_end_time_sec = current_end_latent_frame * VIDEO_LATENT_FRAME_STRIDE / fps
-    n_audio = int(round(current_end_time_sec * AUDIO_LATENT_FRAMES_PER_SECOND)) + audio_lookahead
-    n_audio = max(1, min(n_audio, audio_latent_full.shape[2]))
-    return audio_latent_full[:, :, :n_audio, :]
+    total = audio_latent_full.shape[2]
+    start_sec = window_start_offset_frames * VIDEO_LATENT_FRAME_STRIDE / fps
+    end_sec = frames_through_chunk * VIDEO_LATENT_FRAME_STRIDE / fps
+    a0 = int(round(start_sec * AUDIO_LATENT_FRAMES_PER_SECOND))
+    a1 = int(math.ceil(end_sec * AUDIO_LATENT_FRAMES_PER_SECOND)) + audio_lookahead
+    a0 = max(0, min(a0, total - 1))
+    a1 = max(a0 + 1, min(a1, total))
+    return audio_latent_full[:, :, a0:a1, :]
 
 
 def _build_window_state(
@@ -289,14 +319,18 @@ def streaming_generate(  # noqa: PLR0913, PLR0915
 
     Generates ``num_generated_latent_frames`` latent video frames (frame 0 is
     the sink, so these are the frames *after* the reference). For each AR chunk
-    of up to ``chunk_frames`` latent frames: build a time-aligned frozen audio
-    slice; assemble the ``[sink | history | current]`` window state with a
-    block-causal mask and window-relative positions; run
+    of up to ``chunk_frames`` latent frames: build a window-aligned frozen
+    audio slice; assemble the ``[sink | first | history | current]`` window
+    state with a block-causal mask and window-relative positions; run
     ``euler_denoising_loop`` with :class:`StreamingTwinDenoiser` (which swaps
     the history snapshot noisy↔clean per step and captures the current chunk's
-    noisy mid-snapshot); finalize the chunk's TwinCache snapshots; splice the
-    chunk's clean latent into the full video latent. History is a FIFO ring
-    capped at ``window_chunks``.
+    noisy mid-snapshot); finalize the chunk's snapshots; splice the chunk's
+    clean latent into the full video latent.
+
+    Per Vidu S1 §2.3.1, the persistent reference context is the sink (encoded
+    first-frame latent) plus the *first generated chunk* (always injected
+    clean, never evicted). Subsequent chunks form the rolling TwinCache
+    history, a FIFO ring capped at ``window_chunks``.
 
     Generation is streaming internally (per-step activation memory is O(window),
     independent of total length). The returned full latent is decoded by the
@@ -324,7 +358,10 @@ def streaming_generate(  # noqa: PLR0913, PLR0915
 
     num_steps = len(sigmas) - 1
     sigma_mid_step = max(1, num_steps // 2)
-    history: deque[ChunkSnapshots] = deque(maxlen=window_chunks)
+    # Persistent reference: the first generated chunk (fixed, always clean).
+    first_ref: ChunkSnapshots | None = None
+    # Rolling TwinCache history of subsequent chunks.
+    rolling: deque[ChunkSnapshots] = deque(maxlen=window_chunks)
 
     num_chunks = (num_generated_latent_frames + chunk_frames - 1) // chunk_frames
     frames_generated_before = 0
@@ -333,8 +370,19 @@ def streaming_generate(  # noqa: PLR0913, PLR0915
         current_frames = min(chunk_frames, num_generated_latent_frames - frames_generated_before)
         frames_through_chunk = frames_generated_before + current_frames
 
+        first_frames = first_ref.frames if first_ref is not None else 0
+        rolling_frames = sum(s.frames for s in rolling)
+        # Real latent frames evicted from the window ahead of the rolling
+        # history (0 until the window starts sliding) — the audio slice must
+        # skip the same time span to stay RoPE-aligned with the video window.
+        window_start_offset = frames_generated_before - rolling_frames - first_frames
+
         audio_slice = assemble_audio_slice(
-            audio_latent_full, frames_through_chunk, fps, audio_lookahead
+            audio_latent_full,
+            frames_through_chunk,
+            fps,
+            audio_lookahead,
+            window_start_offset_frames=window_start_offset,
         )
         audio_shape = AudioLatentShape(
             batch=1, channels=audio_slice.shape[1], frames=audio_slice.shape[2], mel_bins=audio_slice.shape[3]
@@ -344,7 +392,7 @@ def streaming_generate(  # noqa: PLR0913, PLR0915
         # Frozen audio control: zero the denoise mask so it never changes.
         audio_state = replace(audio_state, denoise_mask=torch.zeros_like(audio_state.denoise_mask))
 
-        history_list = list(history)
+        history_list = ([first_ref] if first_ref is not None else []) + list(rolling)
         window_state, sink_range, history_ranges, current_range = _build_window_state(
             video_tools=video_tools_full,
             sink_tokens=sink_tokens,
@@ -382,13 +430,22 @@ def streaming_generate(  # noqa: PLR0913, PLR0915
             denoiser=denoiser,
         )
 
-        # Finalize TwinCache snapshots for this chunk.
+        # Finalize this chunk. The first generated chunk joins the persistent
+        # reference context (always clean, never evicted); later chunks get
+        # TwinCache (noisy + clean) snapshots in the rolling FIFO.
         c0, c1 = current_range
         clean_tokens = video_state.latent[:, c0:c1, :].clone()
-        noisy_tokens = (
-            denoiser.noisy_capture.clone() if denoiser.noisy_capture is not None else clean_tokens.clone()
-        )
-        history.append(ChunkSnapshots(tokens_noisy=noisy_tokens, tokens_clean=clean_tokens, frames=current_frames))
+        if first_ref is None:
+            first_ref = ChunkSnapshots(
+                tokens_noisy=clean_tokens, tokens_clean=clean_tokens, frames=current_frames
+            )
+        else:
+            noisy_tokens = (
+                denoiser.noisy_capture.clone() if denoiser.noisy_capture is not None else clean_tokens.clone()
+            )
+            rolling.append(
+                ChunkSnapshots(tokens_noisy=noisy_tokens, tokens_clean=clean_tokens, frames=current_frames)
+            )
 
         # Splice the chunk's clean latent into the full video latent (seamless).
         clean_unpatchified = _unpatchify_tokens(clean_tokens, current_frames, h_lat, w_lat, channels, patchifier)
@@ -401,26 +458,28 @@ def streaming_generate(  # noqa: PLR0913, PLR0915
 
 
 # ---------------------------------------------------------------------------
-# Milestone 2 — KV-cache + RoPE repositioning path (UNTESTED, see plan)
+# Milestone 2 — KV-cache + RoPE repositioning path
+# (validate on GPU with tests/test_streaming_kv_cache_parity.py)
 # ---------------------------------------------------------------------------
 
 
 def _build_window_positions(
     video_tools: VideoLatentTools,
-    history: list[ChunkSnapshots],
+    hist_frames: int,
     current_frames: int,
     device: torch.device,
 ) -> tuple[torch.Tensor, int, int, int]:
-    """Full-window positions ``[sink | history | current]`` (window-relative).
+    """Full-window positions ``[sink | first + history | current]`` (window-relative).
 
-    Returns ``(positions, sink_tokens, hist_tokens, current_tokens)`` where the
-    positions tensor is ``(1, 3, T, 2)`` over the whole window (frame-major), so
-    that the window RoPE stays in the trained range (RoPE repositioning).
+    ``hist_frames`` counts all cached frames (permanent first chunk + rolling
+    history). Returns ``(positions, sink_tokens, hist_tokens, current_tokens)``
+    where the positions tensor is ``(1, 3, T, 2)`` over the whole window
+    (frame-major), so that the window RoPE stays in the trained range (RoPE
+    repositioning).
     """
     h_lat = video_tools.target_shape.height
     w_lat = video_tools.target_shape.width
     tokens_per_frame = h_lat * w_lat
-    hist_frames = sum(s.frames for s in history)
     window_frames = 1 + hist_frames + current_frames
     channels = video_tools.target_shape.channels
     window_shape = VideoLatentShape(batch=1, channels=channels, frames=window_frames, height=h_lat, width=w_lat)
@@ -465,14 +524,22 @@ def streaming_generate_cached(  # noqa: PLR0913, PLR0915
 
     Wraps ``transformer`` with a :class:`CausalStreamingModel` (per-block
     video-self-attn KV cache). Each AR chunk carries only ``[sink | current]``
-    in the modality (history K/V come from the cache); the wrapper builds the
+    in the modality (history K/V come from the cache); the driver builds the
     full-window RoPE ``window_pe`` and the block-causal ``query_mask`` (history
-    query rows removed). TwinCache: history reads the ``noisy`` snapshot during
-    intermediate steps, ``clean`` at the final step; the current chunk's K/V are
-    captured (mid step → noisy, final step → clean) and committed to the cache.
+    query rows removed, converted to a log-space additive bias).
 
-    NOTE: this is a best-effort blind implementation (no local runtime — see the
-    plan's risk section). Run the parity test before trusting it.
+    Per Vidu S1 §2.3.1 the first generated chunk's clean K/V join the
+    persistent reference context (never evicted); subsequent chunks are
+    TwinCache entries in a FIFO ring capped at ``window_chunks`` — the rolling
+    history reads the ``noisy`` snapshot during intermediate steps and
+    ``clean`` at the final step. The current chunk's K/V are captured (mid
+    step → noisy, final step → clean) and committed to the cache.
+
+    NOTE: video self-attention history comes from cached K/V captured when
+    each chunk was *current* (per the paper's KV-cache design); Milestone 1
+    instead recomputes history features as timestep-0 conditioning tokens.
+    The two paths are therefore numerically identical only while no history
+    exists (the first AR chunk) — see the parity test.
     """
     from ltx_core.model.transformer import CausalStreamingModel
     from ltx_pipelines.utils.helpers import post_process_latent
@@ -495,90 +562,114 @@ def streaming_generate_cached(  # noqa: PLR0913, PLR0915
 
     num_steps = len(sigmas) - 1
     sigma_mid_step = max(1, num_steps // 2)
-    history: list[ChunkSnapshots] = []  # for position/mask layout only (K/V live in the cache)
+    # Window layout bookkeeping (frame counts only; K/V live in the caches).
+    # Mirrors the cache eviction exactly: permanent first chunk + rolling FIFO.
+    first_frames = 0
+    rolling_frames: deque[int] = deque(maxlen=window_chunks)
     frames_generated_before = 0
     num_chunks = (num_generated_latent_frames + chunk_frames - 1) // chunk_frames
 
-    for i in range(num_chunks):
-        current_frames = min(chunk_frames, num_generated_latent_frames - frames_generated_before)
-        frames_through_chunk = frames_generated_before + current_frames
-        current_tokens = current_frames * tokens_per_frame
+    try:
+        for i in range(num_chunks):
+            current_frames = min(chunk_frames, num_generated_latent_frames - frames_generated_before)
+            frames_through_chunk = frames_generated_before + current_frames
 
-        # Audio slice (frozen control) for this chunk.
-        audio_slice = assemble_audio_slice(audio_latent_full, frames_through_chunk, fps, audio_lookahead)
-        audio_shape = AudioLatentShape(
-            batch=1, channels=audio_slice.shape[1], frames=audio_slice.shape[2], mel_bins=audio_slice.shape[3]
-        )
-        audio_tools = AudioLatentTools(AudioPatchifier(patch_size=1), audio_shape)
-        audio_state = audio_tools.create_initial_state(device=device, dtype=dtype, initial_latent=audio_slice)
-        audio_state = replace(audio_state, denoise_mask=torch.zeros_like(audio_state.denoise_mask))
+            hist_frames = first_frames + sum(rolling_frames)
+            window_start_offset = frames_generated_before - sum(rolling_frames) - first_frames
 
-        # Full-window positions [sink | history | current] -> window_pe + query_mask.
-        full_positions, sink_t, hist_t, cur_t = _build_window_positions(
-            video_tools_full, history, current_frames, device
-        )
-        window_pe = _window_pe(full_positions, wrapper, dtype)
-        full_frame_indices = torch.arange(
-            full_positions.shape[2], device=device
-        ).repeat_interleave(tokens_per_frame)
-        full_mask = block_causal_attention_mask(full_frame_indices)  # (1, T, T)
-        # query_mask = full block-causal with history query rows removed -> [sink | current] rows.
-        sink_rows = torch.arange(0, sink_t, device=device)
-        current_rows = torch.arange(sink_t + hist_t, sink_t + hist_t + cur_t, device=device)
-        query_rows = torch.cat([sink_rows, current_rows])
-        query_mask = full_mask[:, query_rows, :]
-
-        # Modality carries only [sink | current]; sink frozen, current noised.
-        cur_noise = torch.randn((1, current_tokens, channels), device=device, dtype=dtype, generator=noiser.generator)
-        mod_latent = torch.cat([sink_tokens, cur_noise], dim=1)
-        mod_clean = torch.zeros_like(mod_latent)
-        mod_clean[:, :sink_t] = sink_tokens
-        mod_mask = torch.zeros((1, mod_latent.shape[1], 1), device=device, dtype=torch.float32)
-        mod_mask[:, sink_t:] = 1.0
-        # Modality positions = full positions' [sink | current] rows.
-        mod_positions = full_positions[:, :, query_rows, :]
-        video_state = LatentState(
-            latent=mod_latent,
-            denoise_mask=mod_mask,
-            positions=mod_positions,
-            clean_latent=mod_clean,
-            attention_mask=None,  # cached attn1 uses query_mask via the cache
-        )
-
-        wrapper.prepare_chunk(window_pe=window_pe, query_mask=query_mask, hist_len=hist_t)
-
-        logger.info(
-            "Streaming AR chunk %d/%d (cached; current_frames=%d, history=%d)",
-            i + 1, num_chunks, current_frames, len(history),
-        )
-
-        # Inline per-step loop: toggle TwinCache snapshot mode, run the cached
-        # model, post-process + euler step, capture K/V at mid/final.
-        for step_idx in range(num_steps):
-            mode = "clean" if step_idx == num_steps - 1 else "noisy"
-            wrapper.set_mode(mode)
-            pos_video = modality_from_latent_state(video_state, v_context, sigmas[step_idx])
-            pos_audio = modality_from_latent_state(audio_state, a_context, sigmas[step_idx])
-            denoised_video, _ = wrapper(video=pos_video, audio=pos_audio, perturbations=None)
-            denoised_video = post_process_latent(
-                denoised_video, video_state.denoise_mask, video_state.clean_latent
+            # Audio slice (frozen control), window-aligned like Milestone 1.
+            audio_slice = assemble_audio_slice(
+                audio_latent_full,
+                frames_through_chunk,
+                fps,
+                audio_lookahead,
+                window_start_offset_frames=window_start_offset,
             )
-            if step_idx == sigma_mid_step:
-                wrapper.stash("noisy")
-            if step_idx == num_steps - 1:
-                wrapper.stash("clean")
-            video_state = replace(
-                video_state, latent=stepper.step(video_state.latent, denoised_video, sigmas, step_idx)
+            audio_shape = AudioLatentShape(
+                batch=1, channels=audio_slice.shape[1], frames=audio_slice.shape[2], mel_bins=audio_slice.shape[3]
             )
-        wrapper.commit()
+            audio_tools = AudioLatentTools(AudioPatchifier(patch_size=1), audio_shape)
+            audio_state = audio_tools.create_initial_state(device=device, dtype=dtype, initial_latent=audio_slice)
+            audio_state = replace(audio_state, denoise_mask=torch.zeros_like(audio_state.denoise_mask))
 
-        # Splice the finalized current latent into the full video latent.
-        clean_tokens = video_state.latent[:, sink_t : sink_t + cur_t, :].clone()
-        history.append(ChunkSnapshots(tokens_noisy=clean_tokens.clone(), tokens_clean=clean_tokens, frames=current_frames))
-        clean_unpatchified = _unpatchify_tokens(clean_tokens, current_frames, h_lat, w_lat, channels, patchifier)
-        f0 = 1 + frames_generated_before
-        full_latent[:, :, f0 : f0 + current_frames, :, :] = clean_unpatchified
-        frames_generated_before += current_frames
+            # Full-window positions [sink | first+history | current] -> window_pe + query_mask.
+            full_positions, sink_t, hist_t, cur_t = _build_window_positions(
+                video_tools_full, hist_frames, current_frames, device
+            )
+            window_pe = _window_pe(full_positions, wrapper, dtype)
+            full_frame_indices = torch.arange(
+                full_positions.shape[2], device=device
+            ).repeat_interleave(tokens_per_frame)
+            full_mask = block_causal_attention_mask(full_frame_indices)  # (1, T, T), values in [0, 1]
+            # query_mask = full block-causal with history query rows removed
+            # -> [sink | current] rows, converted to a log-space additive bias
+            # (the cached attention path feeds it straight to masked SDPA).
+            sink_rows = torch.arange(0, sink_t, device=device)
+            current_rows = torch.arange(sink_t + hist_t, sink_t + hist_t + cur_t, device=device)
+            query_rows = torch.cat([sink_rows, current_rows])
+            query_mask = log_bias_from_binary_mask(full_mask[:, query_rows, :], dtype)
 
-    wrapper.reset()
+            # Modality carries only [sink | current]; sink frozen, current noised.
+            # Draw noise over the FULL window and slice the current rows so the
+            # generator consumption matches Milestone 1's window-shaped draw
+            # (same seed => same current-chunk noise; see the parity test).
+            window_noise = torch.randn(
+                (1, sink_t + hist_t + cur_t, channels), device=device, dtype=dtype, generator=noiser.generator
+            )
+            cur_noise = window_noise[:, sink_t + hist_t :, :]
+            mod_latent = torch.cat([sink_tokens, cur_noise], dim=1)
+            mod_clean = torch.zeros_like(mod_latent)
+            mod_clean[:, :sink_t] = sink_tokens
+            mod_mask = torch.zeros((1, mod_latent.shape[1], 1), device=device, dtype=torch.float32)
+            mod_mask[:, sink_t:] = 1.0
+            # Modality positions = full positions' [sink | current] rows.
+            mod_positions = full_positions[:, :, query_rows, :]
+            video_state = LatentState(
+                latent=mod_latent,
+                denoise_mask=mod_mask,
+                positions=mod_positions,
+                clean_latent=mod_clean,
+                attention_mask=None,  # cached attn1 uses query_mask via the cache
+            )
+
+            wrapper.prepare_chunk(window_pe=window_pe, query_mask=query_mask, hist_len=hist_t)
+
+            logger.info(
+                "Streaming AR chunk %d/%d (cached; current_frames=%d, hist_frames=%d)",
+                i + 1, num_chunks, current_frames, hist_frames,
+            )
+
+            # Inline per-step loop: toggle TwinCache snapshot mode, run the cached
+            # model, post-process + euler step, capture K/V at mid/final.
+            for step_idx in range(num_steps):
+                mode = "clean" if step_idx == num_steps - 1 else "noisy"
+                wrapper.set_mode(mode)
+                pos_video = modality_from_latent_state(video_state, v_context, sigmas[step_idx])
+                pos_audio = modality_from_latent_state(audio_state, a_context, sigmas[step_idx])
+                denoised_video, _ = wrapper(video=pos_video, audio=pos_audio, perturbations=None)
+                denoised_video = post_process_latent(
+                    denoised_video, video_state.denoise_mask, video_state.clean_latent
+                )
+                if step_idx == sigma_mid_step:
+                    wrapper.stash("noisy")
+                if step_idx == num_steps - 1:
+                    wrapper.stash("clean")
+                video_state = replace(
+                    video_state, latent=stepper.step(video_state.latent, denoised_video, sigmas, step_idx)
+                )
+            wrapper.commit()
+            if first_frames == 0:
+                first_frames = current_frames  # joined the persistent reference
+            else:
+                rolling_frames.append(current_frames)
+
+            # Splice the finalized current latent into the full video latent.
+            clean_tokens = video_state.latent[:, sink_t : sink_t + cur_t, :].clone()
+            clean_unpatchified = _unpatchify_tokens(clean_tokens, current_frames, h_lat, w_lat, channels, patchifier)
+            f0 = 1 + frames_generated_before
+            full_latent[:, :, f0 : f0 + current_frames, :, :] = clean_unpatchified
+            frames_generated_before += current_frames
+    finally:
+        # Drop the caches and restore the wrapped model's standard forward path.
+        wrapper.detach()
     return full_latent
