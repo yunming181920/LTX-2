@@ -9,8 +9,11 @@ from ltx_core.model.transformer.model_configurator import (
     LTXModelConfigurator,
     LTXVideoOnlyModelConfigurator,
 )
+from ltx_core.model.transformer.streaming_cache import StreamingKVCache
+from ltx_core.model.transformer.streaming_model import CausalStreamingModel
 
 __all__ = [
+    "CausalStreamingModel",
     "LTXV_AUDIO_ONLY_MODEL_COMFY_RENAMING_MAP",
     "LTXV_MODEL_COMFY_RENAMING_MAP",
     "LTXAudioOnlyModelConfigurator",
@@ -18,5 +21,6 @@ __all__ = [
     "LTXModelConfigurator",
     "LTXVideoOnlyModelConfigurator",
     "Modality",
+    "StreamingKVCache",
     "X0Model",
 ]

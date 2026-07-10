@@ -13,7 +13,8 @@ from ltx_core.model.transformer.ops import (
     PytorchGatedAttention,
     PytorchPreAttention,
 )
-from ltx_core.model.transformer.rope import LTXRopeType
+from ltx_core.model.transformer.rope import LTXRopeType, apply_rotary_emb
+from ltx_core.model.transformer.streaming_cache import StreamingKVCache
 
 
 def _torch_default_sdpa_priority() -> list[SDPBackend]:
@@ -514,6 +515,10 @@ class Attention(torch.nn.Module):
 
         self.to_out = torch.nn.Sequential(torch.nn.Linear(inner_dim, query_dim, bias=True), torch.nn.Identity())
 
+        # Milestone 2 streaming KV cache (None => existing forward path, byte-identical).
+        # Only set on video self-attention modules by the CausalStreamingModel wrapper.
+        self.stream_cache: StreamingKVCache | None = None
+
     def forward(
         self,
         x: torch.Tensor,
@@ -553,6 +558,15 @@ class Attention(torch.nn.Module):
         context = x if context is None else context
         use_attention = not all_perturbed
 
+        # Milestone 2: streaming KV-cache path (video self-attention only). When a
+        # cache is attached and active, history K/V come from the cache (pre-RoPE)
+        # and RoPE is re-applied to the assembled keys with the window-relative
+        # ``window_pe`` (RoPE repositioning). Production pipelines never attach a
+        # cache -> ``stream_cache`` is None -> the standard path below runs.
+        cache: StreamingKVCache | None = self.stream_cache
+        if cache is not None and cache.active:
+            return self._stream_cached_forward(x, context, pe, cache, perturbation_mask, all_perturbed)
+
         v = self.to_v(context)
 
         if not use_attention:
@@ -573,4 +587,76 @@ class Attention(torch.nn.Module):
         if self.to_gate_logits is not None:
             out = self.gated_attention_function(x, out, self)
 
+        return self.to_out(out)
+
+    def _stream_cached_forward(
+        self,
+        x: torch.Tensor,
+        context: torch.Tensor,
+        pe,
+        cache: StreamingKVCache,
+        perturbation_mask: torch.Tensor | None,
+        all_perturbed: bool,
+    ) -> torch.Tensor:
+        """Streaming KV-cache self-attention (Milestone 2).
+
+        ``x``/``context`` carry ``[sink (1 frame) | current chunk]`` tokens —
+        the sink is recomputed each step (its K/V depend on the per-chunk audio
+        slice via AV cross-attn, so it is NOT cached, matching the bidirectional
+        path). Generated *history* K/V (pre-RoPE) come from the cache and are
+        spliced between sink and current: ``k_all = [sink | history | current]``
+        in window order, matching the full-window ``window_pe`` (RoPE
+        repositioning). The query is ``[sink | current]``; the block-causal mask
+        is the full-window mask with the history *query* rows removed (history is
+        not queried, only attended to). The current chunk's pre-RoPE K/V are
+        stashed for TwinCache snapshot capture (noisy at the mid step, clean at
+        the final step).
+        """
+        if all_perturbed:
+            return self.to_out(self.to_v(context))
+
+        hw = cache.tokens_per_frame  # sink tokens (1 frame)
+        v_cur = self.to_v(context)  # [sink | current]
+        q = self.to_q(x)
+        k_cur = self.to_k(context)
+        q = self.q_norm(q)
+        k_cur = self.k_norm(k_cur)  # pre-RoPE, [sink | current]
+
+        sink_k, cur_k = k_cur[:, :hw], k_cur[:, hw:]
+        sink_v, cur_v = v_cur[:, :hw], v_cur[:, hw:]
+
+        k_hist, v_hist = cache.read()
+        if k_hist is not None:
+            k_all_pre = torch.cat([sink_k, k_hist, cur_k], dim=1)  # [sink|hist|cur]
+            v_all = torch.cat([sink_v, v_hist, cur_v], dim=1)
+        else:
+            k_all_pre = torch.cat([sink_k, cur_k], dim=1)  # [sink|cur]
+            v_all = torch.cat([sink_v, cur_v], dim=1)
+
+        window_pe = cache.window_pe
+        if window_pe is not None and pe is not None:
+            # Query RoPE uses the passed `pe` (modality positions = [sink|current]);
+            # key RoPE uses the full window pe covering [sink | history | current].
+            q = apply_rotary_emb(q, pe, self.rope_type)
+            k_all = apply_rotary_emb(k_all_pre, window_pe, self.rope_type)
+        elif pe is not None:
+            q = apply_rotary_emb(q, pe, self.rope_type)
+            k_all = k_all_pre
+        else:
+            k_all = k_all_pre
+
+        # Stash the current chunk's pre-RoPE K/V for TwinCache snapshot capture.
+        cache.set_current(cur_k, cur_v)
+
+        mask = cache.query_mask  # (1, sink+cur, full) block-causal, history query rows removed
+        if mask is None or mask.shape[1] != q.shape[1] or mask.shape[-1] != k_all.shape[1]:
+            out = self.attention_function(q, k_all, v_all, self.heads)
+        else:
+            out = self.masked_attention_function(q, k_all, v_all, self.heads, mask)
+
+        if perturbation_mask is not None:
+            out = out * perturbation_mask + v_cur * (1 - perturbation_mask)
+
+        if self.to_gate_logits is not None:
+            out = self.gated_attention_function(x, out, self)
         return self.to_out(out)
