@@ -57,6 +57,33 @@ AUDIO_LATENT_FRAMES_PER_SECOND = 25.0
 VIDEO_LATENT_FRAME_STRIDE = 8
 
 
+def _video_latent_frame_bounds_sec(latent_frame_index: int, fps: float) -> tuple[float, float]:
+    """Causal-VAE video latent frame bounds in seconds.
+
+    Mirrors ``VideoLatentTools.create_initial_state`` + ``get_pixel_coords`` with
+    ``causal_fix=True``: the sink frame spans one pixel frame, and every later
+    latent frame advances by ``VIDEO_LATENT_FRAME_STRIDE`` pixel frames.
+    """
+    start_frame = max(
+        latent_frame_index * VIDEO_LATENT_FRAME_STRIDE + 1 - VIDEO_LATENT_FRAME_STRIDE,
+        0,
+    )
+    end_frame = max(
+        (latent_frame_index + 1) * VIDEO_LATENT_FRAME_STRIDE + 1 - VIDEO_LATENT_FRAME_STRIDE,
+        0,
+    )
+    return start_frame / fps, end_frame / fps
+
+
+def _video_window_offset_sec(evicted_generated_frames: int, fps: float) -> float:
+    """Real-time offset between a slid compact window and the original timeline."""
+    if evicted_generated_frames <= 0:
+        return 0.0
+    real_start, _ = _video_latent_frame_bounds_sec(evicted_generated_frames + 1, fps)
+    window_start, _ = _video_latent_frame_bounds_sec(1, fps)
+    return real_start - window_start
+
+
 def block_causal_attention_mask(frame_indices: torch.Tensor) -> torch.Tensor:
     """Block-causal self-attention mask on the temporal axis.
 
@@ -269,11 +296,13 @@ def assemble_audio_slice(
     the video window's repositioned RoPE (Vidu S1 §2.3.1 RoPE repositioning
     applied to both modalities), and keeps the per-step audio cost O(window).
 
-    Audio latent runs at 25 frames/sec; video latent at ``fps / 8`` frames/sec.
+    Audio latent runs at 25 frames/sec; video times use the same causal-VAE
+    frame bounds as ``VideoLatentTools`` so the slice contents and
+    window-relative video RoPE share one timeline.
     """
     total = audio_latent_full.shape[2]
-    start_sec = window_start_offset_frames * VIDEO_LATENT_FRAME_STRIDE / fps
-    end_sec = frames_through_chunk * VIDEO_LATENT_FRAME_STRIDE / fps
+    start_sec = _video_window_offset_sec(window_start_offset_frames, fps)
+    _, end_sec = _video_latent_frame_bounds_sec(frames_through_chunk, fps)
     a0 = int(round(start_sec * AUDIO_LATENT_FRAMES_PER_SECOND))
     a1 = int(math.ceil(end_sec * AUDIO_LATENT_FRAMES_PER_SECOND)) + audio_lookahead
     a0 = max(0, min(a0, total - 1))
@@ -654,9 +683,14 @@ def streaming_generate_cached(  # noqa: PLR0913, PLR0915
                 video_tools_full, hist_frames, current_frames, device
             )
             window_pe = _window_pe(full_positions, wrapper, dtype)
-            full_frame_indices = torch.arange(
-                full_positions.shape[2], device=device
-            ).repeat_interleave(tokens_per_frame)
+            full_tokens = full_positions.shape[2]
+            if full_tokens != sink_t + hist_t + cur_t:
+                raise RuntimeError(
+                    "Streaming window positions are out of sync with token bookkeeping: "
+                    f"positions={full_tokens}, sink+hist+cur={sink_t + hist_t + cur_t}."
+                )
+            full_window_frames = full_tokens // tokens_per_frame
+            full_frame_indices = torch.arange(full_window_frames, device=device).repeat_interleave(tokens_per_frame)
             full_mask = block_causal_attention_mask(full_frame_indices)  # (1, T, T), values in [0, 1]
             # query_mask = full block-causal with history query rows removed
             # -> [sink | current] rows, converted to a log-space additive bias
