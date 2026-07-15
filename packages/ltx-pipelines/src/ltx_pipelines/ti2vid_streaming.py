@@ -287,10 +287,11 @@ def main() -> None:
         "--use-kv-cache",
         action="store_true",
         help="M2: use the KV-cache + RoPE-repositioning path for BOTH video and audio "
-        "self-attention (faster; history K/V are reused from each chunk's own denoising "
-        "pass per Vidu S1 §2.3.1, so results differ slightly from the default "
-        "full-recompute path — run the joint parity/smoke test before trusting). Default "
-        "off (M1 latent-level TwinCache).",
+        "self-attention (faster; noisy history K/V are reused from each chunk's own "
+        "denoising pass and clean K/V from one extra sigma-0 forward per chunk, per "
+        "Vidu S1 §2.3.1, so results differ slightly from the default full-recompute "
+        "path — run the joint parity/smoke test before trusting). Default off (M1 "
+        "latent-level TwinCache).",
     )
     parser.add_argument(
         "--causal-cross-attn",

@@ -25,7 +25,12 @@ chunk-by-chunk in lockstep so per-step activation memory stays O(window) for
   * **per-token ``denoise_mask``** keeps sink+history frozen (velocity == 0
     under the Euler step) while the current chunk is denoised,
   * **time-causal video↔audio cross-attention mask** built from LTX-2's shared
-    seconds-axis cross-attn RoPE positions.
+    seconds-axis cross-attn RoPE positions. The audio window's clock is aligned
+    to the video window's *compressed* clock (:func:`_audio_window_alignment`):
+    the video window pins sink+first at its head and repositions the rolling
+    section after eviction, so the audio grid must start at its absolute frame
+    and subtract the video's compression shift — otherwise audio current would
+    see video current as future and AV sync would break.
 
 The AR unit is one latent video frame (= 8 pixel frames = ``H_lat * W_lat``
 tokens); ``chunk_frames`` may generate a few latent frames per step, and each
@@ -146,6 +151,12 @@ def cross_causal_attention_mask(
     strict causal (paper-faithful: "conditions available up to frame i"); a small
     positive lookahead lets a video frame peek slightly into future audio (useful
     for lip-sync on a bidirectionally-trained model).
+
+    A query row whose keys are *all* in the future (e.g. the video sink at
+    t~0 once the window's earliest audio starts later) would otherwise become
+    an all-zero row; through the additive log-bias channel that degenerates to
+    *uniform* attention over every key (worse than any causal choice). Such
+    rows fall back to the single earliest key — the minimum-leak option.
     """
     # temporal [start, end) per token, in seconds (dim 0 of the position grid).
     v_start = video_positions[:, 0, :, 0]  # (B, T_v)
@@ -156,7 +167,27 @@ def cross_causal_attention_mask(
     a2v = (a_start[:, None, :] <= v_end[:, :, None] + lookahead_sec).to(torch.float32)
     # v2a: query=audio (T_a), key=video (T_v). [i, j] = v_start[j] <= a_end[i] + la.
     v2a = (v_start[:, None, :] <= a_end[:, :, None] + lookahead_sec).to(torch.float32)
+    a2v = _fallback_empty_rows_to_earliest_key(a2v, a_start)
+    v2a = _fallback_empty_rows_to_earliest_key(v2a, v_start)
     return a2v, v2a
+
+
+def _fallback_empty_rows_to_earliest_key(mask: torch.Tensor, key_start: torch.Tensor) -> torch.Tensor:
+    """Open the earliest key (min start time) for query rows with no visible key.
+
+    ``mask`` is ``(B, T_q, T_k)`` in ``[0, 1]``; ``key_start`` is ``(B, T_k)``
+    start times in seconds. An all-zero row turns into uniform attention after
+    the log-bias conversion (all logits get the same ``finfo.min`` offset), so
+    it must never reach the model; attending only the earliest key is the
+    smallest possible causality leak.
+    """
+    empty = mask.sum(dim=-1) == 0  # (B, T_q)
+    if not bool(empty.any()):
+        return mask
+    earliest = key_start.argmin(dim=-1)  # (B,)
+    fallback = torch.zeros_like(mask)
+    fallback.scatter_(-1, earliest.view(-1, 1, 1).expand(-1, mask.shape[1], 1), 1.0)
+    return torch.where(empty.unsqueeze(-1), fallback, mask)
 
 
 @dataclass
@@ -322,6 +353,39 @@ def _audio_chunk_frame_count(frames_through_chunk: int, audio_generated_before: 
     return max(1, target - audio_generated_before)
 
 
+def _audio_window_alignment(
+    *,
+    audio_generated_before: int,
+    audio_hist_frames: int,
+    video_abs_current_frame: int,
+    video_rel_current_frame: int,
+    fps: float,
+) -> tuple[int, float]:
+    """Align the audio window's clock with the video window's clock.
+
+    The video window keeps the sink + first chunk pinned at its head, so after
+    eviction its rolling/current section sits at *compressed* (window-relative)
+    times: ``rel = abs - shift`` with ``shift = start(video_abs_current_frame)
+    - start(video_rel_current_frame)``. The audio window has no sink/first
+    section — naively rebuilding its positions from frame 0 would put its
+    tokens on a clock offset from the video's by the whole sink+first span,
+    breaking the time-causal AV cross-attention mask and the shared-seconds
+    cross-attn RoPE (audio current would see video current as *future*).
+
+    Returns ``(abs_start_frame, time_shift_sec)``: build the audio window grid
+    starting at absolute audio latent frame ``abs_start_frame`` (the
+    ``AudioPatchifier.shift`` parameter) and subtract ``time_shift_sec`` from
+    the resulting timestamps, landing audio on the same compressed clock as
+    the video window's rolling/current section. Before any eviction both terms
+    reduce to the identity (``abs_start_frame`` = 0 only for the very first
+    chunks; ``time_shift_sec`` = 0 while the video window is uncompressed).
+    """
+    abs_start_frame = audio_generated_before - audio_hist_frames
+    v_abs_start, _ = _video_latent_frame_bounds_sec(video_abs_current_frame, fps)
+    v_rel_start, _ = _video_latent_frame_bounds_sec(video_rel_current_frame, fps)
+    return abs_start_frame, v_abs_start - v_rel_start
+
+
 def _patchify_audio_frame_latent(unpatchified: torch.Tensor, patchifier: AudioPatchifier) -> torch.Tensor:
     """``(1, C, T, mel) -> (1, T, C*mel)`` patchified audio tokens (1 token/frame)."""
     return patchifier.patchify(unpatchified)
@@ -355,17 +419,21 @@ def _build_audio_window_state(
     noiser: Noiser,
     device: torch.device,
     dtype: torch.dtype,
+    abs_start_frame: int = 0,
+    time_shift_sec: float = 0.0,
 ) -> tuple[LatentState, list[tuple[int, int]], tuple[int, int]]:
     """Assemble the audio sliding-window LatentState for one AR step.
 
     Layout (token order): ``[history chunks ... | current]`` (no sink — audio has
     no image conditioning). History: ``denoise_mask = 0`` (frozen; the denoiser
     injects the TwinCache snapshot per step). Current: ``denoise_mask = 1``
-    (denoised), initialised to pure noise by the noiser. Positions are
-    window-relative (built by ``AudioLatentTools.create_initial_state``), matching
-    the video window's repositioned RoPE so AV cross-attn stays aligned. The
-    block-causal attention mask is built over per-token audio frame indices
-    (1 token per audio frame).
+    (denoised), initialised to pure noise by the noiser. Positions start at
+    absolute audio latent frame ``abs_start_frame`` shifted back by
+    ``time_shift_sec`` (see :func:`_audio_window_alignment`) so the audio clock
+    matches the video window's compressed clock — keeping the time-causal AV
+    cross-attn mask and the shared-seconds cross-attn RoPE aligned while audio
+    self-attn RoPE (shift-invariant) is unaffected. The block-causal attention
+    mask is built over per-token audio frame indices (1 token per audio frame).
     """
     channels = audio_tools_full.target_shape.channels
     mel_bins = audio_tools_full.target_shape.mel_bins
@@ -373,8 +441,10 @@ def _build_audio_window_state(
     window_frames = hist_frames + current_frames
 
     window_shape = AudioLatentShape(batch=1, channels=channels, frames=window_frames, mel_bins=mel_bins)
-    window_tools = AudioLatentTools(AudioPatchifier(patch_size=1), window_shape)
+    window_tools = AudioLatentTools(AudioPatchifier(patch_size=1, shift=abs_start_frame), window_shape)
     state = window_tools.create_initial_state(device=device, dtype=dtype)
+    if time_shift_sec:
+        state = replace(state, positions=state.positions - time_shift_sec)
 
     # 1 token per audio frame: token ranges == frame ranges.
     history_ranges: list[tuple[int, int]] = []
@@ -602,8 +672,15 @@ def streaming_generate_joint(  # noqa: PLR0913, PLR0915
             dtype=dtype,
         )
 
-        # --- audio window [history | current] ---
+        # --- audio window [history | current], clock-aligned to the video window ---
         audio_history = list(rolling_audio)
+        a_abs_start, a_time_shift = _audio_window_alignment(
+            audio_generated_before=audio_generated_before,
+            audio_hist_frames=sum(s.frames for s in audio_history),
+            video_abs_current_frame=1 + frames_generated_before,
+            video_rel_current_frame=1 + sum(s.frames for s in video_history),
+            fps=fps,
+        )
         audio_state, audio_history_ranges, audio_current_range = _build_audio_window_state(
             audio_tools_full=audio_tools_full,
             history=audio_history,
@@ -611,6 +688,8 @@ def streaming_generate_joint(  # noqa: PLR0913, PLR0915
             noiser=noiser,
             device=device,
             dtype=dtype,
+            abs_start_frame=a_abs_start,
+            time_shift_sec=a_time_shift,
         )
 
         # --- time-causal AV cross-attention masks (window-relative positions) ---
@@ -698,23 +777,32 @@ def streaming_generate_joint(  # noqa: PLR0913, PLR0915
 
 
 def _build_audio_window_positions(
-    audio_tools: AudioLatentTools, hist_frames: int, current_frames: int, device: torch.device
+    audio_tools: AudioLatentTools,
+    hist_frames: int,
+    current_frames: int,
+    device: torch.device,
+    abs_start_frame: int = 0,
+    time_shift_sec: float = 0.0,
 ) -> tuple[torch.Tensor, int, int]:
-    """Full-window audio positions ``[history | current]`` (window-relative, no sink).
+    """Full-window audio positions ``[history | current]`` (no sink).
 
     Audio has 1 token per frame, so token counts == frame counts. Returns
     ``(positions, hist_tokens, current_tokens)`` with ``positions`` shaped
-    ``(1, 1, T, 2)`` over the whole window, so audio self-attn RoPE stays in the
-    trained range (RoPE repositioning), mirroring :func:`_build_window_positions`
-    for video but without a sink.
+    ``(1, 1, T, 2)`` over the whole window. The grid starts at absolute audio
+    latent frame ``abs_start_frame`` shifted back by ``time_shift_sec`` (see
+    :func:`_audio_window_alignment`), landing on the video window's compressed
+    clock — this keeps positions in the trained range (RoPE repositioning),
+    keeps audio self-attn RoPE unchanged (shift-invariant), and keeps the
+    time-causal AV cross-attn mask / shared-seconds cross RoPE aligned.
     """
     channels = audio_tools.target_shape.channels
     mel_bins = audio_tools.target_shape.mel_bins
     window_frames = hist_frames + current_frames
     window_shape = AudioLatentShape(batch=1, channels=channels, frames=window_frames, mel_bins=mel_bins)
-    window_tools = AudioLatentTools(AudioPatchifier(patch_size=1), window_shape)
+    window_tools = AudioLatentTools(AudioPatchifier(patch_size=1, shift=abs_start_frame), window_shape)
     state = window_tools.create_initial_state(device=device, dtype=torch.float32)
-    return state.positions, hist_frames, current_frames
+    positions = state.positions - time_shift_sec if time_shift_sec else state.positions
+    return positions, hist_frames, current_frames
 
 
 def streaming_generate_joint_cached(  # noqa: PLR0913, PLR0915
@@ -751,7 +839,10 @@ def streaming_generate_joint_cached(  # noqa: PLR0913, PLR0915
 
     The TwinCache noisy/clean snapshot selection and the permanent video
     first-chunk slot follow Vidu S1 §2.3.1. Audio uses a pure FIFO ring (no
-    permanent slot).
+    permanent slot). The *clean* K/V snapshot is captured by one extra
+    forward on the finalized (post-final-Euler-step) latents at sigma 0 per
+    chunk — the paper's "clean cache obtained after the final denoising step"
+    — rather than from the final step's still-noisy input.
 
     NOTE: conceptual/unvalidated — extends an already-untested M2 path to a
     second modality with a different (sink-less) layout. Run
@@ -829,11 +920,24 @@ def streaming_generate_joint_cached(  # noqa: PLR0913, PLR0915
             v_query_rows = torch.cat([v_sink_rows, v_current_rows])
             v_query_mask = log_bias_from_binary_mask(v_full_mask[:, v_query_rows, :], dtype)
 
-            # --- audio window positions/mask [history | current] (no sink) ---
+            # --- audio window positions/mask [history | current] (no sink),
+            # clock-aligned to the video window ---
             a_hist_t = sum(rolling_audio_frames)
             a_cur_t = current_audio_frames  # 1 token per audio frame
+            a_abs_start, a_time_shift = _audio_window_alignment(
+                audio_generated_before=audio_generated_before,
+                audio_hist_frames=a_hist_t,
+                video_abs_current_frame=1 + frames_generated_before,
+                video_rel_current_frame=1 + v_hist_frames,
+                fps=fps,
+            )
             a_full_positions, _, _ = _build_audio_window_positions(
-                audio_tools_full, a_hist_t, current_audio_frames, device
+                audio_tools_full,
+                a_hist_t,
+                current_audio_frames,
+                device,
+                abs_start_frame=a_abs_start,
+                time_shift_sec=a_time_shift,
             )
             a_window_pe = _window_pe(a_full_positions, wrapper, dtype, audio=True)
             a_full_tokens = a_full_positions.shape[2]
@@ -924,14 +1028,26 @@ def streaming_generate_joint_cached(  # noqa: PLR0913, PLR0915
                 )
                 if step_idx == sigma_mid_step:
                     wrapper.stash("noisy")
-                if step_idx == num_steps - 1:
-                    wrapper.stash("clean")
                 video_state = replace(
                     video_state, latent=stepper.step(video_state.latent, denoised_video, sigmas, step_idx)
                 )
                 audio_state = replace(
                     audio_state, latent=stepper.step(audio_state.latent, denoised_audio, sigmas, step_idx)
                 )
+
+            # Clean-KV refresh (Vidu S1 §2.3.1: the clean cache is "obtained
+            # AFTER the final denoising step"). The loop's last forward saw the
+            # current chunk at sigma[-2] (still noisy), so its K/V are not the
+            # clean snapshot. Run one extra forward on the finalized latents at
+            # sigma 0 — the exact condition under which M1 presents this chunk
+            # as clean history (timestep-0 conditioning tokens) — and stash
+            # that as the "clean" TwinCache entry. Output is discarded.
+            wrapper.set_mode("clean")
+            zero_sigma = torch.zeros_like(sigmas[0])
+            pos_video = modality_from_latent_state(video_state, v_context, zero_sigma)
+            pos_audio = modality_from_latent_state(audio_state, a_context, zero_sigma)
+            wrapper(video=pos_video, audio=pos_audio, perturbations=None)
+            wrapper.stash("clean")
             wrapper.commit()
             if first_frames == 0:
                 first_frames = current_video_frames  # joined the persistent reference
