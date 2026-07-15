@@ -39,9 +39,9 @@ Per the chosen scope:
 | Persistent reference context = first-frame latent **+ first generated video state** | ✅ | `sink_tokens` + `first_ref` (video permanent slot, never evicted) |
 | Cached historical states within the window | ✅ | `rolling_video` / `rolling_audio` deques (M1) · `StreamingKVCache` FIFO rings (M2) |
 | **RoPE Repositioning** (cache pre-RoPE K/V, reapply at updated window positions) | ✅ | M1: fresh `VideoLatentTools` / `AudioLatentTools` window-relative positions · M2: `attention.py::_stream_cached_forward` caches pre-RoPE K and reapplies `window_pe` |
-| **TwinCache** (noisy cache from a mid step + clean cache from the final step) | ✅ | `ChunkSnapshots` + `JointStreamingTwinDenoiser._inject` (M1) / cache `stash`+`commit` (M2); intermediate steps read noisy, final step reads clean |
+| **TwinCache** (noisy cache from a mid step + clean cache **after** the final step) | ✅ | `ChunkSnapshots` + `JointStreamingTwinDenoiser._inject` (M1) / cache `stash`+`commit` (M2, clean K/V captured by one extra sigma-0 forward on the finalized latents per chunk); intermediate steps read noisy, final step reads clean |
 | Causal attention mask on the temporal axis | ✅ | `block_causal_attention_mask` (frame-major: bidirectional within a frame, causal across frames) — applied to both video and audio self-attention |
-| Causal mask on AV **cross**-attention (video↔audio) | ✅ (default ON) | `cross_causal_attention_mask` built from LTX-2’s shared seconds-axis cross-attn RoPE positions; applied to both `audio_to_video_attn` and `video_to_audio_attn` (`--no-causal-cross-attn` to disable) |
+| Causal mask on AV **cross**-attention (video↔audio) | ✅ (default ON) | `cross_causal_attention_mask` built from LTX-2’s shared seconds-axis cross-attn RoPE positions; applied to both `audio_to_video_attn` and `video_to_audio_attn` (`--no-causal-cross-attn` to disable). The audio window's clock is aligned to the video window's compressed clock (`_audio_window_alignment`) so the mask and the cross RoPE stay AV-synchronized after eviction; query rows with no causally visible key fall back to the earliest key (an all-zero row would degenerate to uniform attention) |
 | Per-block KV cache (video **and** audio self-attention) | ✅ (M2) | `StreamingKVCache` × 48 blocks per modality: video keeps a 1-frame sink + permanent first-chunk slot; audio uses a pure no-sink FIFO ring |
 | Joint audio generation with its own sliding-window history | ✅ | each video AR chunk also produces its time-aligned audio latent frames (`_audio_chunk_frame_count`); audio history is a FIFO capped at `--window-chunks` |
 
@@ -152,7 +152,11 @@ uv run python packages/ltx-pipelines/tests/test_streaming_joint_parity.py \
     --gemma-root models/gemma-3-12b --image ref.jpg
 ```
 
-The pure-tensor unit test (`tests/test_streaming_joint.py`) needs no checkpoint.
+Two checkpoint-free tests also cover the streaming plumbing: the pure-tensor
+unit test (`tests/test_streaming_joint.py`, incl. the audio/video window clock
+alignment and the empty-cross-row fallback) and a tiny-random-model validation
+(`tests/test_streaming_tiny_model.py`: single-chunk M1≡M2 bitwise parity with
+causal cross-attn off/on + multi-chunk eviction smoke, CPU-only).
 
 ### Files added / changed by this fork
 
@@ -165,6 +169,7 @@ The pure-tensor unit test (`tests/test_streaming_joint.py`) needs no checkpoint.
 - `packages/ltx-core/src/ltx_core/model/transformer/transformer_args.py`, `modality.py`, `ltx_core/types.py`, `ltx_pipelines/utils/helpers.py` — `cross_attention_mask` field plumbed `LatentState → Modality → TransformerArgs → block`
 - `packages/ltx-core/src/ltx_core/model/transformer/__init__.py` — new exports
 - `packages/ltx-pipelines/tests/test_streaming_joint.py` — pure-tensor unit test
+- `packages/ltx-pipelines/tests/test_streaming_tiny_model.py` — tiny-random-model M1/M2 parity + eviction smoke (CPU, no checkpoint)
 - `packages/ltx-pipelines/tests/test_streaming_joint_parity.py` — M1/M2 parity + smoke test
 - `packages/ltx-pipelines/tests/test_cross_causal_mask.py` — unit test for `cross_causal_attention_mask`
 
@@ -200,9 +205,9 @@ Vidu S1（arXiv:2607.03118）是一个实时交互式音→视频模型，其 §
 | 持久参考上下文 = 首帧 latent **+ 第一个生成的视频状态** | ✅ | `sink_tokens` + `first_ref`（视频永久槽位，永不淘汰） |
 | 窗口内缓存历史状态 | ✅ | `rolling_video` / `rolling_audio` deque（M1）/ `StreamingKVCache` FIFO 环（M2） |
 | **RoPE 重定位**（缓存 RoPE 前的 K/V，按更新后的窗口位置重新施加） | ✅ | M1：用 fresh `VideoLatentTools` / `AudioLatentTools` 重建窗口相对位置 · M2：`attention.py::_stream_cached_forward` 缓存 pre-RoPE K 并用 `window_pe` 重新施加 |
-| **TwinCache**（mid 步的 noisy 缓存 + 末步的 clean 缓存） | ✅ | `ChunkSnapshots` + `JointStreamingTwinDenoiser._inject`（M1）/ cache `stash`+`commit`（M2）；中间步读 noisy、末步读 clean |
+| **TwinCache**（mid 步的 noisy 缓存 + 末步**之后**的 clean 缓存） | ✅ | `ChunkSnapshots` + `JointStreamingTwinDenoiser._inject`（M1）/ cache `stash`+`commit`（M2，clean K/V 通过每 chunk 一次 sigma-0 额外前向从最终 latent 提取）；中间步读 noisy、末步读 clean |
 | 时间轴因果注意力掩码 | ✅ | `block_causal_attention_mask`（帧主序：帧内双向、跨帧因果）—— 同时作用于视频与音频自注意力 |
-| AV **跨**注意力因果掩码（video↔audio） | ✅（默认开启） | `cross_causal_attention_mask`，基于 LTX-2 跨注意力 RoPE 的共享秒轴位置构建；同时作用于 `audio_to_video_attn` 与 `video_to_audio_attn`（`--no-causal-cross-attn` 可关闭） |
+| AV **跨**注意力因果掩码（video↔audio） | ✅（默认开启） | `cross_causal_attention_mask`，基于 LTX-2 跨注意力 RoPE 的共享秒轴位置构建；同时作用于 `audio_to_video_attn` 与 `video_to_audio_attn`（`--no-causal-cross-attn` 可关闭）。音频窗口时钟通过 `_audio_window_alignment` 与视频窗口的压缩时钟对齐，保证淘汰发生后掩码与跨模态 RoPE 仍音画同步；无可见 key 的查询行回退到最早的 key（全零行会退化为均匀注意力） |
 | 每块 KV cache（视频**与**音频自注意力） | ✅（M2） | 每模态 `StreamingKVCache` × 48 块：视频保留 1 帧 sink + 永久首 chunk 槽；音频为无 sink 的纯 FIFO 环 |
 | 联合音频生成，自带滑动窗口历史 | ✅ | 每个视频 AR chunk 同时生成时间对齐的音频 latent 帧（`_audio_chunk_frame_count`）；音频历史为以 `--window-chunks` 为上限的 FIFO |
 
@@ -289,7 +294,10 @@ uv run python packages/ltx-pipelines/tests/test_streaming_joint_parity.py \
     --gemma-root models/gemma-3-12b --image ref.jpg
 ```
 
-纯张量单元测试（`tests/test_streaming_joint.py`）无需 checkpoint。
+另有两个无需 checkpoint 的测试覆盖流式管线：纯张量单元测试
+（`tests/test_streaming_joint.py`，含音视频窗口时钟对齐与跨注意力空行回退）和微型随机模型校验
+（`tests/test_streaming_tiny_model.py`：单 chunk M1≡M2 逐位一致（跨注意力因果开/关）+ 多 chunk
+淘汰冒烟，仅需 CPU）。
 
 ### 本 fork 新增 / 修改的文件
 
@@ -300,6 +308,7 @@ uv run python packages/ltx-pipelines/tests/test_streaming_joint_parity.py \
 - `packages/ltx-core/src/ltx_core/model/transformer/attention.py` —— `stream_cache` 属性 + `_stream_cached_forward`（音频无 sink 布局）
 - `packages/ltx-core/src/ltx_core/model/transformer/__init__.py` —— 新增导出
 - `packages/ltx-pipelines/tests/test_streaming_joint.py` —— 纯张量单元测试
+- `packages/ltx-pipelines/tests/test_streaming_tiny_model.py` —— 微型随机模型 M1/M2 parity + 淘汰冒烟（CPU，无需 checkpoint）
 - `packages/ltx-pipelines/tests/test_streaming_joint_parity.py` —— M1/M2 parity + 冒烟测试
 
 ### 上游 LTX-2
