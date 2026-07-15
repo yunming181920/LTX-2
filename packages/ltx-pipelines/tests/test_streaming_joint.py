@@ -15,6 +15,8 @@ import torch
 
 from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.components.patchifiers import AudioPatchifier
+from ltx_core.model.transformer.attention import PytorchAttention
+from ltx_core.model.transformer.masking import BlockCausalMask
 from ltx_core.tools import AudioLatentTools
 from ltx_core.types import AudioLatentShape, VideoLatentShape, VideoPixelShape
 from ltx_pipelines.utils.streaming import (
@@ -23,6 +25,7 @@ from ltx_pipelines.utils.streaming import (
     _audio_window_alignment,
     _build_audio_window_state,
     _video_latent_frame_bounds_sec,
+    block_causal_attention_mask,
     cross_causal_attention_mask,
 )
 
@@ -92,17 +95,20 @@ def test_audio_window_state() -> None:
     assert state.latent.shape == (1, window_frames, 128), f"latent {state.latent.shape}"
     assert state.denoise_mask.shape == (1, window_frames, 1), f"mask {state.denoise_mask.shape}"
     assert state.positions.shape == (1, 1, window_frames, 2), f"positions {state.positions.shape}"
-    assert state.attention_mask.shape == (1, window_frames, window_frames), f"attn {state.attention_mask.shape}"
+    # Structured block-causal mask (served by unmasked prefix attention calls).
+    assert isinstance(state.attention_mask, BlockCausalMask), f"attn {type(state.attention_mask)}"
+    dense = state.attention_mask.to_dense()
+    assert dense.shape == (1, window_frames, window_frames), f"attn {dense.shape}"
 
     # denoise_mask: 0 on history (3 frames, frozen), 1 on current (denoised).
     assert torch.all(state.denoise_mask[0, :3, 0] == 0), "history must be frozen (mask 0)"
     assert torch.all(state.denoise_mask[0, 3:, 0] == 1), "current must be denoised (mask 1)"
 
-    # block-causal: each row is a prefix of ones (allow past, mask future).
+    # block-causal: each row is a prefix of ones (allow past, mask future);
+    # audio is 1 token/frame, so the structure is exactly token-causal.
     for i in range(window_frames):
-        assert _is_prefix_of_ones(state.attention_mask[0, i]), (
-            f"audio row {i} not a causal prefix: {state.attention_mask[0, i].tolist()}"
-        )
+        assert _is_prefix_of_ones(dense[0, i]), f"audio row {i} not a causal prefix: {dense[0, i].tolist()}"
+        assert torch.equal(dense[0, i], (torch.arange(window_frames) <= i).float()), f"row {i} not causal"
 
     assert hist_ranges == [(0, 2), (2, 3)], f"history ranges {hist_ranges}"
     assert cur_range == (3, 6), f"current range {cur_range}"
@@ -207,6 +213,45 @@ def test_cross_mask_empty_row_fallback() -> None:
     print("[empty-row] all-zero cross rows fall back to the earliest key OK")
 
 
+def test_block_causal_mask_matches_dense_bias() -> None:
+    """BlockCausalMask.apply (unmasked prefix decomposition, the FlashAttention-
+    compatible path) must reproduce dense additive-bias masked SDPA exactly.
+
+    Covers the three streaming layouts: M1 square (q == k, full window), M2
+    video (queries = [sink | current] over full-window keys, history query rows
+    removed), and M2 audio (queries = [current], 1 token per frame)."""
+    torch.manual_seed(3)
+    heads, dim_head, tpf = 2, 8, 4  # tokens per (video) frame
+    attn = PytorchAttention()
+
+    def dense_masked(q, k, v, mask01):
+        bias = (1.0 - mask01).to(q.dtype) * torch.finfo(q.dtype).min  # (1, Tq, Tk)
+        return attn(q, k, v, heads, mask=bias)
+
+    cases = []
+    # M1 square: window of 5 frames, q == k.
+    frames = torch.arange(5).repeat_interleave(tpf)
+    cases.append(("m1-square", frames, frames))
+    # M2 video: q = [sink (frame 0) | current (frames 3, 4)], k = full window.
+    k_frames = torch.arange(5).repeat_interleave(tpf)
+    q_frames = torch.cat([torch.zeros(tpf, dtype=torch.long), k_frames[3 * tpf :]])
+    cases.append(("m2-video", q_frames, k_frames))
+    # M2 audio: 1 token/frame, q = current rows only.
+    ak = torch.arange(7)
+    cases.append(("m2-audio", ak[4:], ak))
+
+    for name, qf, kf in cases:
+        mask = block_causal_attention_mask(qf, kf)
+        q = torch.randn(2, len(qf), heads * dim_head)
+        k = torch.randn(2, len(kf), heads * dim_head)
+        v = torch.randn(2, len(kf), heads * dim_head)
+        out_prefix = mask.apply(attn, q, k, v, heads)
+        out_dense = dense_masked(q, k, v, mask.to_dense())
+        diff = (out_prefix - out_dense).abs().max().item()
+        assert diff < 1e-5, f"[{name}] prefix decomposition != dense bias (max|diff|={diff:.3e})"
+        print(f"[block-causal {name}] prefix decomposition == dense bias (max|diff|={diff:.3e}) OK")
+
+
 def main() -> None:
     torch.manual_seed(0)
     test_audio_chunk_tiling()
@@ -214,6 +259,7 @@ def main() -> None:
     test_joint_cross_mask_shapes()
     test_audio_window_clock_alignment()
     test_cross_mask_empty_row_fallback()
+    test_block_causal_mask_matches_dense_bias()
     print("\nALL TESTS PASSED")
 
 

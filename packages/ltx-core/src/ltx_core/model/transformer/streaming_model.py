@@ -20,8 +20,8 @@ Two modalities can be cached, selected at construction:
 
 The driver (``ltx_pipelines.utils.streaming``) calls:
   * :meth:`prepare_chunk` once per AR chunk with the full-window RoPE
-    ``window_pe`` and block-causal ``query_mask`` (log-space additive bias, history
-    query rows removed) for video — and, when caching audio, the equivalent pair
+    ``window_pe`` and block-causal ``query_mask`` (structured ``BlockCausalMask``, history
+    query rows removed; served by unmasked prefix calls, FlashAttention-capable) for video — and, when caching audio, the equivalent pair
     for audio (no-sink layout ``[history | current]``);
   * :meth:`set_mode` per denoising step (``"noisy"`` mid-denoising, ``"clean"``
     final) — selects which TwinCache snapshot the rolling history reads;

@@ -5,6 +5,8 @@ from dataclasses import dataclass
 
 import torch
 
+from ltx_core.model.transformer.masking import BlockCausalMask
+
 
 @dataclass(frozen=True)
 class Modality:
@@ -33,11 +35,16 @@ class Modality:
         context: Text conditioning embeddings from the prompt encoder.
         enabled: Whether this modality is active in the current forward pass.
         context_mask: Optional mask for the text context tokens.
-        attention_mask: Optional 2-D self-attention mask, shape ``(B, T, T)``.
-            Values in ``[0, 1]`` where ``1`` = full attention and ``0`` = no
-            attention. ``None`` means unrestricted (full) attention between
-            all tokens. Built incrementally by conditioning items; see
-            :class:`~ltx_core.conditioning.types.attention_strength_wrapper.ConditioningItemAttentionStrengthWrapper`.
+        attention_mask: Optional self-attention mask. Either a dense tensor of
+            shape ``(B, T, T)`` with values in ``[0, 1]`` (``1`` = full
+            attention, ``0`` = no attention; built incrementally by
+            conditioning items, see
+            :class:`~ltx_core.conditioning.types.attention_strength_wrapper.ConditioningItemAttentionStrengthWrapper`)
+            or a structured
+            :class:`~ltx_core.model.transformer.masking.BlockCausalMask`
+            (streaming block-causal self-attention; served by unmasked prefix
+            calls, FlashAttention-capable). ``None`` means unrestricted (full)
+            attention between all tokens.
         cross_attention_mask: Optional AV cross-attention mask, shape
             ``(B, T_q, T_k)`` with values in ``[0, 1]`` (``1`` = attend,
             ``0`` = mask). ``T_q`` is this modality's token count, ``T_k`` the
@@ -57,7 +64,7 @@ class Modality:
     context: torch.Tensor
     enabled: bool = True
     context_mask: torch.Tensor | None = None
-    attention_mask: torch.Tensor | None = None
+    attention_mask: torch.Tensor | BlockCausalMask | None = None
     cross_attention_mask: torch.Tensor | None = None
 
     def split(self, sizes: list[int]) -> list[Modality]:
@@ -68,7 +75,8 @@ class Modality:
             value = getattr(self, f.name)
             if isinstance(value, torch.Tensor):
                 split_fields[f.name] = list(value.split(sizes, dim=0))
-            elif value is None or isinstance(value, bool):
+            elif value is None or isinstance(value, (bool, BlockCausalMask)):
+                # BlockCausalMask is batch-agnostic (no batch dim): replicate.
                 split_fields[f.name] = [value] * n
             else:
                 raise TypeError(f"Cannot split field {f.name!r}: unsupported type {type(value)}")

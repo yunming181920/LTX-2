@@ -7,6 +7,7 @@ from typing import Protocol
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+from ltx_core.model.transformer.masking import BlockCausalMask
 from ltx_core.model.transformer.ops import (
     GatedAttentionCallable,
     PreAttentionCallable,
@@ -30,11 +31,19 @@ def _torch_default_sdpa_priority() -> list[SDPBackend]:
 
 
 flash_attn_interface = None
+flash_attn_2_func = None
 flash_attn_4_func = None
 try:
     import flash_attn_interface
 except ImportError:
     flash_attn_interface = None
+try:
+    # FlashAttention2: the classic `flash-attn` package (sm80+). No mask kernel;
+    # served by the unmasked protocol (block-causal masks reach it via the
+    # BlockCausalMask prefix decomposition, never as a bias tensor).
+    from flash_attn import flash_attn_func as flash_attn_2_func
+except ImportError:
+    flash_attn_2_func = None
 try:
     from flash_attn.cute import flash_attn_func as flash_attn_4_func
 except ImportError:
@@ -142,6 +151,37 @@ class MPSSdpaAttention(AttentionCallable):
 
         out = _mps_sdpa_opt(q, k, v, attn_mask=mask)
         out = out.transpose(1, 2).reshape(b, -1, heads * dim_head)
+        return out
+
+
+class FlashAttention2(AttentionCallable):
+    """FlashAttention2 (`flash-attn` package, sm80+). Unmasked protocol only —
+    FA2 has no additive-mask kernel. The streaming block-causal masks reach it
+    through the :class:`BlockCausalMask` prefix decomposition (one unmasked
+    call per query frame block over its contiguous key/value prefix), so the
+    causal streaming paths run on FA2 without any bias tensor."""
+
+    label = "FlashAttention2"
+
+    def __call__(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        heads: int,
+    ) -> torch.Tensor:
+        if flash_attn_2_func is None:
+            raise RuntimeError("FlashAttention2 was selected but `flash-attn` is not installed.")
+        if q.device.type != "cuda":
+            raise RuntimeError("FlashAttention2 requires CUDA. Use PyTorch SDPA on CPU or MPS.")
+
+        b, _, dim_head = q.shape
+        dim_head //= heads
+
+        q, k, v = (t.view(b, -1, heads, dim_head) for t in (q, k, v))
+
+        out = flash_attn_2_func(q.to(v.dtype), k.to(v.dtype), v)
+        out = out.reshape(b, -1, heads * dim_head)
         return out
 
 
@@ -268,15 +308,17 @@ def _sdpa_full_priority() -> PytorchAttention:
 def _select_primary_attention() -> AttentionCallable:
     """Pick the fastest unmasked attention based on installed extras and GPU arch.
     Priority by arch:
-    - Hopper (sm_90, H100): FA3 > FA4 > SDPA.
+    - Hopper (sm_90, H100): FA3 > FA4 > FA2 > SDPA.
     - Datacenter Blackwell (sm_100, B200): FA4 > SDPA. FA4 is intentionally *not*
       picked on consumer Blackwell (sm_120) -- known regressions in newer
       FA4 betas; users who want it on sm_120 must opt in explicitly.
+    - Ampere / Ada (sm_80/86/89): FA2 (`flash-attn`) when installed, else SDPA.
+      FA2 wheels target sm80-sm90 only, so it is not auto-picked on Blackwell.
     - macOS (Apple Silicon / MPS): Apple's fused MPSGraph kernel via ``mps-sdpa``
       (a platform-marked hard dependency on Apple Silicon) -- it avoids the
       full-score-matrix memory wall on long video sequences. On a non-Apple-Silicon
       mac (Intel/CPU) it falls back to torch's SDPA.
-    - Everywhere else (Ada, Ampere, CPU): SDPA with the full backend priority
+    - Everywhere else (CPU, older CUDA): SDPA with the full backend priority
       list -- torch's runtime dispatcher picks the best fit at call time.
     """
     if torch.cuda.is_available():
@@ -288,6 +330,8 @@ def _select_primary_attention() -> AttentionCallable:
                 return FlashAttention4()
         if major == 10 and flash_attn_4_func is not None:
             return FlashAttention4()
+        if major in (8, 9) and flash_attn_2_func is not None:
+            return FlashAttention2()
     if _on_macos():
         return MPSSdpaAttention() if _mps_sdpa_available() else _sdpa_full_priority()
     return _sdpa_full_priority()
@@ -344,6 +388,7 @@ def _resolve_sdpa_variant(backend: SDPBackend, name: str, *, with_mask: bool) ->
 
 class AttentionFunction(Enum):
     PYTORCH = "pytorch"
+    FLASH_ATTENTION_2 = "flash_attention_2"
     FLASH_ATTENTION_3 = "flash_attention_3"
     FLASH_ATTENTION_4 = "flash_attention_4"
     SDPA_CUDNN = "sdpa_cudnn"
@@ -372,6 +417,16 @@ class AttentionFunction(Enum):
                 return automatic_attention()
             case AttentionFunction.PYTORCH:
                 return PytorchAttention()
+            case AttentionFunction.FLASH_ATTENTION_2:
+                if flash_attn_2_func is None:
+                    raise RuntimeError(
+                        "AttentionFunction.FLASH_ATTENTION_2 selected but `flash-attn` is not installed."
+                    )
+                if not torch.cuda.is_available():
+                    raise RuntimeError(
+                        "AttentionFunction.FLASH_ATTENTION_2 requires CUDA. Use PyTorch SDPA on CPU or MPS."
+                    )
+                return FlashAttention2()
             case AttentionFunction.FLASH_ATTENTION_3:
                 if flash_attn_interface is None:
                     raise RuntimeError(
@@ -416,8 +471,11 @@ class MaskedAttentionFunction(Enum):
     """Backends usable on the masked path. Mirrors :class:`AttentionFunction` minus
     the variants the torch SDPA dispatcher (or the wrapped kernel) rejects with a
     mask: ``SDPA_FLASH`` -- FLASH kernel cannot serve an additive ``attn_mask``;
-    ``FLASH_ATTENTION_3``/``FLASH_ATTENTION_4`` -- neither has a mask kernel at all.
-    Keeping them out makes "this backend cannot mask" a type error, not a runtime one."""
+    ``FLASH_ATTENTION_2``/``FLASH_ATTENTION_3``/``FLASH_ATTENTION_4`` -- none has a
+    mask kernel at all. Keeping them out makes "this backend cannot mask" a type
+    error, not a runtime one. Block-causal masks avoid this path entirely: a
+    structured :class:`BlockCausalMask` decomposes into unmasked prefix calls on
+    the *unmasked* backend (FlashAttention included)."""
 
     PYTORCH = "pytorch"
     SDPA_CUDNN = "sdpa_cudnn"
@@ -523,7 +581,7 @@ class Attention(torch.nn.Module):
         self,
         x: torch.Tensor,
         context: torch.Tensor | None = None,
-        mask: torch.Tensor | None = None,
+        mask: torch.Tensor | BlockCausalMask | None = None,
         pe: torch.Tensor | None = None,
         k_pe: torch.Tensor | None = None,
         perturbation_mask: torch.Tensor | None = None,
@@ -537,10 +595,11 @@ class Attention(torch.nn.Module):
             x: Query input tensor of shape ``(B, T, query_dim)``.
             context: Key/value context tensor of shape ``(B, S, context_dim)``.
                 Falls back to ``x`` (self-attention) when *None*.
-            mask: Optional attention mask. Interpretation depends on the attention
-                backend (additive bias for PyTorch SDPA). A non-None
-                ``mask`` routes to ``masked_attention_function``; ``None`` keeps
-                the unmasked path.
+            mask: Optional attention mask. A dense tensor is an additive bias
+                and routes to ``masked_attention_function``; a structured
+                :class:`BlockCausalMask` decomposes into unmasked per-block
+                prefix calls on ``attention_function`` (FlashAttention-capable);
+                ``None`` keeps the unmasked path.
             pe: Rotary positional embeddings applied to both ``q`` and ``k``.
             k_pe: Separate rotary positional embeddings for ``k`` only. When
                 *None*, ``pe`` is reused for keys.
@@ -574,9 +633,13 @@ class Attention(torch.nn.Module):
         else:
             q = self.to_q(x)
             k = self.to_k(context)
-            q, k = self.preattention_function(q, k, self, mask, pe, k_pe)
+            q, k = self.preattention_function(q, k, self, None if isinstance(mask, BlockCausalMask) else mask, pe, k_pe)
             if mask is None:
                 out = self.attention_function(q, k, v, self.heads)  # (B, T, H*D)
+            elif isinstance(mask, BlockCausalMask):
+                # Structured block-causal mask: exact prefix decomposition into
+                # unmasked calls -- runs on the (Flash-capable) unmasked backend.
+                out = mask.apply(self.attention_function, q, k, v, self.heads)
             else:
                 out = self.masked_attention_function(q, k, v, self.heads, mask)
 
@@ -589,7 +652,7 @@ class Attention(torch.nn.Module):
 
         return self.to_out(out)
 
-    def _stream_cached_forward(
+    def _stream_cached_forward(  # noqa: PLR0912
         self,
         x: torch.Tensor,
         context: torch.Tensor,
@@ -609,11 +672,13 @@ class Attention(torch.nn.Module):
         in window order, matching the full-window ``window_pe`` (RoPE
         repositioning). The query is ``[sink | current]``; ``cache.query_mask``
         is the full-window block-causal mask with the history *query* rows
-        removed (history is not queried, only attended to), already converted
-        by the driver to a **log-space additive bias** (0.0 keep / finfo.min
-        drop) so it plugs straight into the masked SDPA path. The current
-        chunk's pre-RoPE K/V are stashed for TwinCache snapshot capture (noisy
-        at the mid step, clean at the final step).
+        removed (history is not queried, only attended to), provided by the
+        driver as a structured :class:`BlockCausalMask` — served by exact
+        unmasked per-block prefix calls on the (Flash-capable) unmasked backend.
+        A dense log-space additive bias is still accepted (legacy) and routes
+        to the masked backend. The current chunk's pre-RoPE K/V are stashed for
+        TwinCache snapshot capture (noisy at the mid step, clean at the final
+        step).
 
         Note: this path applies ``q_norm``/``k_norm`` + RoPE explicitly
         (equivalent to the default :class:`PytorchPreAttention`); custom
@@ -655,15 +720,27 @@ class Attention(torch.nn.Module):
         # Stash the current chunk's pre-RoPE K/V for TwinCache snapshot capture.
         cache.set_current(cur_k, cur_v)
 
-        # (1, sink+cur, full) log-space additive bias, history query rows removed.
+        # Block-causal visibility for the [sink | current] query rows over the
+        # full [sink | hist | current] key window. Preferred form: a structured
+        # BlockCausalMask -> exact unmasked prefix decomposition (FlashAttention-
+        # capable). A dense (1, sink+cur, full) log-space additive bias is still
+        # accepted for backward compatibility (routes to the masked backend).
         mask = cache.query_mask
         if mask is None:
             out = self.attention_function(q, k_all, v_all, self.heads)
-        else:
-            if mask.shape[1] != q.shape[1] or mask.shape[-1] != k_all.shape[1]:
+        elif isinstance(mask, BlockCausalMask):
+            if mask.num_q_tokens != q.shape[1] or mask.num_k_tokens != k_all.shape[1]:
                 # A silent fallback here would drop causality; fail loudly —
                 # this means the driver's window layout and the cache contents
                 # went out of sync (e.g. eviction bookkeeping mismatch).
+                raise RuntimeError(
+                    "StreamingKVCache query_mask covers "
+                    f"q={mask.num_q_tokens}/k={mask.num_k_tokens} tokens but got "
+                    f"q={q.shape[1]} / k={k_all.shape[1]}; window layout and cache are out of sync."
+                )
+            out = mask.apply(self.attention_function, q, k_all, v_all, self.heads)
+        else:
+            if mask.shape[1] != q.shape[1] or mask.shape[-1] != k_all.shape[1]:
                 raise RuntimeError(
                     "StreamingKVCache query_mask shape "
                     f"{tuple(mask.shape)} does not match q={q.shape[1]} / "

@@ -65,8 +65,8 @@ class StreamingKVCache:
       1. ``set_active(mode, window_pe, query_mask, hist_len, tokens_per_frame)``
          before each forward — selects which snapshot the ring reads
          (``"noisy"`` mid-denoising, ``"clean"`` final) and provides the
-         full-window RoPE ``window_pe`` plus the log-space additive
-         ``query_mask`` and history token length.
+         full-window RoPE ``window_pe`` plus the block-causal
+         ``query_mask`` (a structured ``BlockCausalMask``) and history token length.
       2. The cached attention path calls :meth:`read` for history K/V and
          :meth:`set_current` to stash the freshly-computed current-chunk K/V.
       3. At the mid step the driver calls :meth:`stash` (``"noisy"``); at the
@@ -92,9 +92,11 @@ class StreamingKVCache:
         self.active: bool = False
         self.mode: str | None = None  # "noisy" | "clean"
         self.window_pe: tuple[torch.Tensor, torch.Tensor] | None = None  # (cos, sin) [sink|first|hist|cur]
-        # (1, sink+cur, full) log-space additive bias (0.0 keep / finfo.min drop),
-        # block-causal with history query rows removed.
-        self.query_mask: torch.Tensor | None = None
+        # Block-causal visibility of the [sink | current] query rows over the
+        # full window: a structured BlockCausalMask (preferred; unmasked prefix
+        # calls, FlashAttention-capable) or a legacy dense (1, sink+cur, full)
+        # log-space additive bias.
+        self.query_mask = None
         self.tokens_per_frame: int = 0  # sink token count (1 latent frame)
         self.hist_len: int = 0  # cached history token count (first + ring)
         # Current-chunk pre-RoPE K/V (stashed by the attention path each forward).

@@ -91,6 +91,15 @@ def pad_modality_for_uniform_sharding(
         # conversion and produces a (1, 1, 1, T_padded) bias.
         attention_mask = torch.ones(1, 1, t_padded, dtype=torch.float32, device=device)
         attention_mask[:, :, t_orig:] = 0.0
+    elif not isinstance(modality.attention_mask, torch.Tensor):
+        # Structured masks (e.g. the streaming BlockCausalMask) slice k/v by
+        # token prefix inside the attention module -- incompatible with
+        # sequence-parallel token sharding. Streaming causal drivers are
+        # single-GPU; fail loudly instead of silently dropping causality.
+        raise NotImplementedError(
+            f"Sequence parallelism does not support structured attention masks "
+            f"({type(modality.attention_mask).__name__}); use a single GPU for streaming causal inference."
+        )
     else:
         # User-supplied (B, T, T) [0, 1] mask: extend with padded rows/cols.
         # Padded query rows attend to all valid keys so their softmax stays

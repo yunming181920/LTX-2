@@ -10,7 +10,11 @@ chunk-by-chunk in lockstep so per-step activation memory stays O(window) for
 
   * **block-causal self-attention mask** on each modality's temporal axis
     (routed through ``Modality.attention_mask`` →
-    ``TransformerArgs.self_attention_mask`` — no DiT changes),
+    ``TransformerArgs.self_attention_mask`` — no DiT changes). Built as a
+    structured :class:`BlockCausalMask` (per query frame block, the visible
+    contiguous key prefix), NOT a dense additive bias — the attention module
+    serves it with exact unmasked prefix calls, so the causal paths run on
+    FlashAttention backends (which have no additive-mask kernel),
   * **sliding-window decoding** with a persistent video reference context per
     Vidu S1 §2.3.1: the encoded first-frame latent ("sink", fixed at
     window-relative frame 0) **plus the first generated video chunk** (fixed
@@ -62,6 +66,7 @@ from ltx_core.components.diffusion_steps import EulerDiffusionStep
 from ltx_core.components.noisers import GaussianNoiser, Noiser
 from ltx_core.components.patchifiers import AudioPatchifier, VideoLatentPatchifier
 from ltx_core.model.transformer import X0Model
+from ltx_core.model.transformer.masking import BlockCausalMask
 from ltx_core.tools import AudioLatentTools, VideoLatentTools
 from ltx_core.types import AudioLatentShape, LatentState, VideoLatentShape
 from ltx_pipelines.utils.helpers import modality_from_latent_state
@@ -94,33 +99,29 @@ def _video_latent_frame_bounds_sec(latent_frame_index: int, fps: float) -> tuple
     return start_frame / fps, end_frame / fps
 
 
-def block_causal_attention_mask(frame_indices: torch.Tensor) -> torch.Tensor:
-    """Block-causal self-attention mask on the temporal axis.
+def block_causal_attention_mask(
+    frame_indices: torch.Tensor, k_frame_indices: torch.Tensor | None = None
+) -> BlockCausalMask:
+    """Structured block-causal self-attention mask on the temporal axis.
 
-    ``frame_indices`` is a 1-D tensor of per-token frame indices ``(T,)``.
-    Returns a ``(1, T, T)`` float mask in ``[0, 1]`` where
-    ``mask[q, k] = 1`` iff ``frame_indices[k] <= frame_indices[q]``: a token may
-    attend to every token of an earlier-or-equal frame (fully bidirectional
-    *within* a frame's spatial block, causal *across* frames). This is the
-    faithful interpretation of the paper's causal mask for a frame-major
-    patchifier. The ``[0, 1]`` form plugs straight into the existing
-    ``self_attention_mask`` additive-log-bias channel.
+    ``frame_indices`` is a 1-D tensor of per-token *query* frame indices
+    ``(T_q,)``; ``k_frame_indices`` the per-token *key* frame indices ``(T_k,)``
+    (defaults to the query indices: the square self-attention case). The
+    block-causal rule is ``key frame <= query frame``: a token may attend to
+    every token of an earlier-or-equal frame (fully bidirectional *within* a
+    frame's spatial block, causal *across* frames) — the faithful
+    interpretation of the paper's causal mask for a frame-major patchifier.
+
+    Returns a :class:`BlockCausalMask` (per query frame block, the visible
+    contiguous key-prefix length) instead of a dense ``(T_q, T_k)`` additive
+    bias: the attention module serves it with exact **unmasked** per-block
+    prefix calls, so the causal streaming paths run on FlashAttention backends
+    (FA2/FA3/FA4 and torch SDPA's FLASH kernel), which have no additive-mask
+    support.
     """
-    fi = frame_indices.to(torch.long)
-    # (T, 1) <= (1, T) -> (T, T); key frame <= query frame.
-    mask = (fi.unsqueeze(1) >= fi.unsqueeze(0)).to(torch.float32)
-    return mask.unsqueeze(0)  # (1, T, T)
-
-
-def log_bias_from_binary_mask(mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    """Convert a binary ``[0, 1]`` attention mask to a log-space additive bias.
-
-    ``1 -> 0.0`` (keep) and ``0 -> finfo(dtype).min`` (drop) — the same
-    semantics the core preprocessor applies to ``Modality.attention_mask``
-    (``TransformerArgsPreprocessor._prepare_self_attention_mask``), for masks
-    that bypass that channel (the Milestone 2 cached-attention ``query_mask``).
-    """
-    return ((1.0 - mask).to(dtype)) * torch.finfo(dtype).min
+    return BlockCausalMask.from_frame_indices(
+        frame_indices, frame_indices if k_frame_indices is None else k_frame_indices
+    )
 
 
 def cross_causal_attention_mask(
@@ -835,7 +836,7 @@ def streaming_generate_joint_cached(  # noqa: PLR0913, PLR0915
     ring). Each AR chunk carries only ``[sink | current]`` (video) / ``[current]``
     (audio) in the modalities (history K/V come from the caches); the driver
     builds the full-window RoPE ``window_pe`` and the block-causal ``query_mask``
-    (history query rows removed, log-space additive bias) for *both* modalities.
+    (history query rows removed, structured ``BlockCausalMask``) for *both* modalities.
 
     The TwinCache noisy/clean snapshot selection and the permanent video
     first-chunk slot follow Vidu S1 §2.3.1. Audio uses a pure FIFO ring (no
@@ -914,11 +915,15 @@ def streaming_generate_joint_cached(  # noqa: PLR0913, PLR0915
             v_full_frame_indices = torch.arange(v_full_window_frames, device=device).repeat_interleave(
                 tokens_per_frame
             )
-            v_full_mask = block_causal_attention_mask(v_full_frame_indices)
             v_sink_rows = torch.arange(0, v_sink_t, device=device)
             v_current_rows = torch.arange(v_sink_t + v_hist_t, v_sink_t + v_hist_t + v_cur_t, device=device)
             v_query_rows = torch.cat([v_sink_rows, v_current_rows])
-            v_query_mask = log_bias_from_binary_mask(v_full_mask[:, v_query_rows, :], dtype)
+            # Structured block-causal mask (history query rows removed): queries
+            # are [sink | current], keys the full window. Served by unmasked
+            # prefix attention calls (FlashAttention-capable).
+            v_query_mask = block_causal_attention_mask(
+                v_full_frame_indices[v_query_rows], v_full_frame_indices
+            )
 
             # --- audio window positions/mask [history | current] (no sink),
             # clock-aligned to the video window ---
@@ -947,9 +952,10 @@ def streaming_generate_joint_cached(  # noqa: PLR0913, PLR0915
                     f"positions={a_full_tokens}, hist+cur={a_hist_t + a_cur_t}."
                 )
             a_full_frame_indices = torch.arange(a_full_tokens, device=device)  # 1 token/frame
-            a_full_mask = block_causal_attention_mask(a_full_frame_indices)
             a_current_rows = torch.arange(a_hist_t, a_hist_t + a_cur_t, device=device)
-            a_query_mask = log_bias_from_binary_mask(a_full_mask[:, a_current_rows, :], dtype)
+            a_query_mask = block_causal_attention_mask(
+                a_full_frame_indices[a_current_rows], a_full_frame_indices
+            )
 
             # --- video modality: carries [sink | current]; sink frozen, current noised ---
             # Draw noise over the FULL video window and slice the current rows so
