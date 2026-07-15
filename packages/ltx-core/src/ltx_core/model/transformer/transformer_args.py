@@ -4,6 +4,7 @@ import torch
 
 from ltx_core.guidance.perturbations import BatchedPerturbationConfig, PerturbationType
 from ltx_core.model.transformer.adaln import AdaLayerNormSingle
+from ltx_core.model.transformer.masking import BlockCausalMask
 from ltx_core.model.transformer.modality import Modality
 from ltx_core.model.transformer.rope import (
     LTXRopeType,
@@ -26,9 +27,10 @@ class TransformerArgs:
     cross_gate_timestep: torch.Tensor | None
     enabled: bool
     prompt_timestep: torch.Tensor | None = None
-    self_attention_mask: torch.Tensor | None = (
-        None  # Additive log-space self-attention bias (B, 1, T, T), None = full attention
-    )
+    # Additive log-space self-attention bias (B, 1, T, T), or a structured
+    # BlockCausalMask (streaming block-causal; served by unmasked prefix calls,
+    # FlashAttention-capable). None = full attention.
+    self_attention_mask: "torch.Tensor | BlockCausalMask | None" = None
     # Additive log-space AV cross-attention bias (B, 1, T_q, T_k) for this modality
     # attending the *other* modality; None = full bidirectional cross-attention.
     # Only populated by the streaming causal driver; None for all production pipelines.
@@ -151,8 +153,8 @@ class TransformerArgsPreprocessor:
         ) * torch.finfo(x_dtype).max
 
     def _prepare_self_attention_mask(
-        self, attention_mask: torch.Tensor | None, x_dtype: torch.dtype
-    ) -> torch.Tensor | None:
+        self, attention_mask: "torch.Tensor | BlockCausalMask | None", x_dtype: torch.dtype
+    ) -> "torch.Tensor | BlockCausalMask | None":
         """Prepare self-attention mask by converting [0,1] values to additive log-space bias.
         Input shape: 3D ``(B, T_q, T_k)`` with values in [0, 1]. The dense form
         is ``(B, T, T)``; broadcastable forms like ``(1, 1, T)`` (key-only
@@ -163,10 +165,15 @@ class TransformerArgsPreprocessor:
         Positions with attention_mask <= 0 are fully masked (mapped to the dtype's minimum
         representable value). Strictly positive entries are converted via log-space for
         smooth attenuation, with small values clamped for numerical stability.
-        Returns None if input is None (no masking).
+        Returns None if input is None (no masking). A structured
+        :class:`BlockCausalMask` (streaming block-causal self-attention) passes
+        through unchanged — it never becomes a bias tensor; the attention module
+        serves it via unmasked prefix calls (FlashAttention-capable).
         """
         if attention_mask is None:
             return None
+        if isinstance(attention_mask, BlockCausalMask):
+            return attention_mask
 
         # Convert [0, 1] attention mask to additive log-space bias:
         #   1.0 -> log(1.0) = 0.0  (no bias, full attention)

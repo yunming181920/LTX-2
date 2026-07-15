@@ -1,7 +1,10 @@
 from dataclasses import dataclass, replace
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
+
+if TYPE_CHECKING:
+    from ltx_core.model.transformer.masking import BlockCausalMask
 
 
 class VideoPixelShape(NamedTuple):
@@ -191,8 +194,10 @@ class LatentState:
         denoise_mask: Mask encoding the denoising strength for each token (1 = full denoising, 0 = no denoising).
         positions: Positional indices for each latent element, used for positional embeddings.
         clean_latent: Initial state of the latent before denoising, may include conditioning latents.
-        attention_mask: Optional 2D self-attention mask of shape (B, T, T). Values in [0, 1] where 1 = full attention,
-            0 = no attention. None means full attention everywhere. Built incrementally by conditioning items.
+        attention_mask: Optional self-attention mask. Either a dense 2D tensor of shape (B, T, T) with values
+            in [0, 1] (1 = full attention, 0 = no attention; built incrementally by conditioning items) or a
+            structured ``BlockCausalMask`` (streaming block-causal self-attention; served by unmasked prefix
+            attention calls, FlashAttention-capable). None means full attention everywhere.
         cross_attention_mask: Optional AV cross-attention mask, shape (B, T_q, T_k) with values in
             [0, 1] (1 = attend, 0 = mask). ``T_q`` is this modality's token count and ``T_k`` the
             *other* modality's. None (default) leaves cross-attention full bidirectional. Only set by
@@ -203,7 +208,7 @@ class LatentState:
     denoise_mask: torch.Tensor
     positions: torch.Tensor
     clean_latent: torch.Tensor
-    attention_mask: torch.Tensor | None = None
+    attention_mask: "torch.Tensor | BlockCausalMask | None" = None
     cross_attention_mask: torch.Tensor | None = None
 
     def clone(self) -> "LatentState":
