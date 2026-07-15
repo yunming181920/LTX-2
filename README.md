@@ -139,6 +139,71 @@ Standard LTX-2 flags (`--seed`, `--quantization`, `--offload`, `--compile`,
 `--num-frames`, `--frame-rate`, `--height`, `--width`, `--num-inference-steps`)
 behave as in upstream pipelines.
 
+### Interactive streaming (Gradio, live prompt injection)
+
+`packages/ltx-pipelines/src/ltx_pipelines/app_gradio.py` is an **interactive** front
+end on top of the same streaming machinery: a long-lived session (DiT + Gemma + VAEs
+built once) generates chunk-by-chunk and **streams** the growing video + live audio to
+a browser. While it streams, editing the **live prompt** textbox rewrites the
+cross-attention conditioning for the *next* chunk — so the generated content changes
+mid-clip. This is safe because text is cross-attention only: it is **not** part of the
+cached self-attention history (TwinCache / KV cache) or the sink, so a prompt change
+does **not** reset the video or invalidate the sliding-window state.
+
+**Model file placement** (the spatial upsampler is *not* used by the streaming app —
+only the DiT checkpoint + Gemma are):
+
+```
+models/
+├─ ltx-2.3/
+│  ├─ ltx-2.3-22b-dev.safetensors                 # full bf16 DiT (recommended for streaming)
+│  └─ ltx-2.3-22b-distilled-fp8.safetensors       # distilled fp8 DiT (see notes)
+└─ gemma-3-12b/                                   # clone of google/gemma-3-12b-it-qat-q4_0-unquantized
+   └─ model-0000X-of-0000Y.safetensors (+ repo files)
+```
+
+**Launch — fp8 DiT, everything else bf16** (your `ltx-2.3-22b-distilled-fp8.safetensors`):
+`--quantization` quantizes **only the DiT** (`DiffusionStage`); Gemma and the VAEs stay
+bf16 automatically.
+
+```bash
+uv run python -m ltx_pipelines.app_gradio \
+    --checkpoint-path models/ltx-2.3/ltx-2.3-22b-distilled-fp8.safetensors \
+    --gemma-root models/gemma-3-12b \
+    --quantization fp8-scaled-mm
+```
+
+**Launch — full bf16 DiT** (recommended; the streaming path is designed for the full model):
+
+```bash
+uv run python -m ltx_pipelines.app_gradio \
+    --checkpoint-path models/ltx-2.3/ltx-2.3-22b-dev.safetensors \
+    --gemma-root models/gemma-3-12b
+```
+
+Open the printed URL, upload a reference image (the sink), set the initial prompt, hit
+**Generate**, and edit the live prompt while it streams. `--host/--port/--share` control
+serving. New files: `ltx_pipelines/utils/streaming_interactive.py` (generator driver with
+a per-chunk context resolver), `ltx_pipelines/interactive_session.py` (session + `PromptSlot`
++ `LivePromptEncoder` + incremental decode), `app_gradio.py` (UI).
+
+Notes:
+- `fp8-scaled-mm` is for **pre-quantized** fp8 checkpoints (on-disk `F8_E4M3` weight +
+  `.weight_scale`); `fp8-cast` is for bf16 checkpoints (casts bf16→fp8 at load). Picking the
+  wrong one errors with a clear message.
+- Do **not** combine `--quantization fp8-scaled-mm` with `--offload cpu/disk` — block
+  streaming only supports bf16 / `fp8-cast`. With an fp8 DiT the whole model must fit on GPU.
+  The long-lived session keeps the DiT + Gemma (12B, bf16) + VAEs resident at once, so expect
+  high VRAM use (≈ A100/H100 class). If VRAM-constrained, use the full bf16 checkpoint with
+  `--offload cpu` instead.
+- The distilled weights are tuned for 3-step *bidirectional* generation; the causal streaming
+  path is a train/test mismatch. It runs, but quality is better with the full bf16 dev
+  checkpoint. If you do use the distilled checkpoint, set a low step count (≈ 3–8) in the UI.
+
+M1 path only; runtime-unverified here (no GPU) — the CPU unit test
+`tests/test_streaming_interactive.py` covers constant-context M1 parity, the per-chunk
+swap guarantee, and the resolver call count.
+
 ### Validate M2 against M1 (parity test)
 
 Loads the full checkpoint + Gemma and needs a reference image (no audio needed).
@@ -281,6 +346,61 @@ uv run python -m ltx_pipelines.ti2vid_streaming \
 标准 LTX-2 参数（`--seed`、`--quantization`、`--offload`、`--compile`、`--enhance-prompt`、
 `--lora`、`--prompt`、`--negative-prompt`、`--image PATH FRAME_IDX STRENGTH [CRF]`、
 `--num-frames`、`--frame-rate`、`--height`、`--width`、`--num-inference-steps`）与上游管线一致。
+
+### 交互式流式（Gradio，实时改写提示词）
+
+`packages/ltx-pipelines/src/ltx_pipelines/app_gradio.py` 是同一套流式机制之上的 **交互式** 前端：
+一个长驻会话（DiT + Gemma + VAE 只构建一次）按 chunk 生成，并把不断增长的画面 + 实时音频
+**流式** 推送到浏览器。生成过程中编辑 **live prompt** 文本框，会改写 *下一个* chunk 的
+跨注意力条件 —— 于是画面内容会中途改变。这是安全的，因为文本只是跨注意力：它 **不属于**
+缓存的自注意力历史（TwinCache / KV cache）或 sink，所以改提示词 **不会** 重置画面、不会
+作废滑动窗口状态。
+
+**模型文件放置**（流式 app **不使用** 空间上采样器 —— 只需 DiT checkpoint + Gemma）：
+
+```
+models/
+├─ ltx-2.3/
+│  ├─ ltx-2.3-22b-dev.safetensors                 # 完整 bf16 DiT（流式推荐）
+│  └─ ltx-2.3-22b-distilled-fp8.safetensors       # 蒸馏 fp8 DiT（见注意事项）
+└─ gemma-3-12b/                                   # google/gemma-3-12b-it-qat-q4_0-unquantized 的克隆
+   └─ model-0000X-of-0000Y.safetensors（及仓库其余文件）
+```
+
+**启动 —— DiT 用 fp8，其余 bf16**（你的 `ltx-2.3-22b-distilled-fp8.safetensors`）：
+`--quantization` **只量化 DiT**（`DiffusionStage`）；Gemma 与 VAE 自动保持 bf16。
+
+```bash
+uv run python -m ltx_pipelines.app_gradio \
+    --checkpoint-path models/ltx-2.3/ltx-2.3-22b-distilled-fp8.safetensors \
+    --gemma-root models/gemma-3-12b \
+    --quantization fp8-scaled-mm
+```
+
+**启动 —— 完整 bf16 DiT**（推荐；流式路径是为完整模型设计的）：
+
+```bash
+uv run python -m ltx_pipelines.app_gradio \
+    --checkpoint-path models/ltx-2.3/ltx-2.3-22b-dev.safetensors \
+    --gemma-root models/gemma-3-12b
+```
+
+打开打印的 URL，上传参考图（sink），设好初始提示词，点 **Generate**，然后在流式过程中编辑
+live prompt 即可。`--host/--port/--share` 控制服务。新增文件：`ltx_pipelines/utils/streaming_interactive.py`
+（带逐 chunk context resolver 的生成器驱动）、`ltx_pipelines/interactive_session.py`
+（会话 + `PromptSlot` + `LivePromptEncoder` + 增量解码）、`app_gradio.py`（UI）。
+
+注意事项：
+- `fp8-scaled-mm` 用于 **已量化** 的 fp8 checkpoint（盘上是 `F8_E4M3` weight + `.weight_scale`）；
+  `fp8-cast` 用于 bf16 checkpoint（加载时把 bf16 转 fp8）。选错会有清晰的报错。
+- **不要** 把 `--quantization fp8-scaled-mm` 与 `--offload cpu/disk` 同时用 —— 块流式只支持
+  bf16 / `fp8-cast`。用 fp8 DiT 时整个模型都必须放进显存。长驻会话会同时常驻 DiT + Gemma（12B，bf16）
+  + VAE，显存占用很高（约 A100/H100 级别）。若显存吃紧，改用完整 bf16 checkpoint + `--offload cpu`。
+- 蒸馏权重是为 3 步 *双向* 生成调优的；因果流式路径属于训练/测试不匹配。能跑，但用完整 bf16 dev
+  checkpoint 质量更好。若确实用蒸馏 checkpoint，请在 UI 里把步数调低（约 3–8）。
+
+仅 M1 路径；此处未经运行时验证（无 GPU）—— CPU 单测 `tests/test_streaming_interactive.py` 覆盖
+常量 context 与 M1 的等价、逐 chunk 改写保证、resolver 调用次数。
 
 ### 校验 M2 与 M1 的一致性（parity 测试）
 
