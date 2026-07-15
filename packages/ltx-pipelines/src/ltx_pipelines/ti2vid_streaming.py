@@ -1,42 +1,55 @@
-"""Streaming, autoregressive, causal audio-to-video (A2V) pipeline.
+"""Streaming, autoregressive, causal text/image-to-video+audio (TI2V) pipeline.
 
 Training-free reproduction of Vidu S1 §2.3 streaming inference on top of the
 pretrained *bidirectional* LTX-2 checkpoint (used as-is as the "causal model").
 
-Milestone 1: block-causal self-attention mask + sliding-window decoding +
-persistent reference context per Vidu S1 §2.3.1 (the encoded first-frame
-latent "sink" plus the first generated chunk, both fixed and never evicted) +
-latent-level TwinCache (noisy/clean history snapshots swapped per denoising
-step) + frozen audio control (window-aligned slice, window-relative
-positions). Generation is streaming internally (per-step activation memory is
-O(window)); the full latent is decoded once at the end (causal-VAE seamless
-decode) and streamed out.
+Unlike an audio-to-video (A2V) streaming setup (where audio is a frozen control
+signal and only video is generated), TI2V has no audio input:
+it generates **both** video and audio. This pipeline generates them chunk by
+chunk in lockstep — each video AR chunk also produces its time-aligned audio
+latent frames — with a sliding window, persistent reference context per Vidu S1
+§2.3.1 (the encoded first-frame "sink" plus the first generated *video* chunk,
+fixed and never evicted), latent-level TwinCache (noisy/clean history snapshots
+swapped per denoising step) for **both** modalities, block-causal self-attention
+masks on both temporal axes, and a time-causal video↔audio cross-attention mask.
 
-No core (ltx-core) changes; reuses ``DiffusionStage.model_context`` for the
-transformer lifecycle, ``PromptEncoder``/``ImageConditioner``/``AudioConditioner``
-for IO, ``VideoDecoder`` for output, and the streaming primitives in
+Audio keeps its own sliding-window FIFO history (no sink / no persistent anchor
+— audio has no image conditioning), so per-step activation memory is O(window)
+for both modalities. The full latents are decoded once at the end (causal-VAE
+seamless video decode + audio decode) and returned.
+
+Two paths:
+  * **M1** (default): latent TwinCache, full per-step recompute of history
+    features — the correct, recommended path.
+  * **M2** (``--use-kv-cache``): per-block KV cache + RoPE repositioning for
+    *both* video and audio self-attention. Faster, but conceptual/unvalidated
+    (extends an already-untested A2V M2 path to a second modality with a
+    sink-less layout) — run ``tests/test_streaming_joint_parity.py`` in a GPU
+    env before trusting.
+
+No core (ltx-core) production changes; reuses ``DiffusionStage.model_context``
+for the transformer lifecycle, ``PromptEncoder``/``ImageConditioner`` for IO,
+``VideoDecoder``/``AudioDecoder`` for output, and the streaming primitives in
 :mod:`ltx_pipelines.utils.streaming`.
 """
 
 import argparse
 import logging
-import math
 from collections.abc import Iterator
 
 import torch
 
 from ltx_core.components.diffusion_steps import EulerDiffusionStep
 from ltx_core.components.noisers import GaussianNoiser
-from ltx_core.components.patchifiers import VideoLatentPatchifier
+from ltx_core.components.patchifiers import AudioPatchifier, VideoLatentPatchifier
 from ltx_core.components.schedulers import LTX2Scheduler
 from ltx_core.loader import LoraPathStrengthAndSDOps
 from ltx_core.loader.registry import Registry
-from ltx_core.model.audio_vae import encode_audio as vae_encode_audio
 from ltx_core.model.transformer.compiling import CompilationConfig
 from ltx_core.model.video_vae.tiling import TilingConfig
 from ltx_core.quantization import QuantizationPolicy
-from ltx_core.tools import VideoLatentTools
-from ltx_core.types import Audio, VideoLatentShape, VideoPixelShape
+from ltx_core.tools import AudioLatentTools, VideoLatentTools
+from ltx_core.types import Audio, AudioLatentShape, VideoLatentShape, VideoPixelShape
 from ltx_pipelines.utils.allocator_trim_strategy import AllocatorTrimStrategy
 from ltx_pipelines.utils.args import (
     ImageConditioningInput,
@@ -44,27 +57,27 @@ from ltx_pipelines.utils.args import (
     resolve_cli_params,
 )
 from ltx_pipelines.utils.blocks import (
-    AudioConditioner,
+    AudioDecoder,
     DiffusionStage,
     ImageConditioner,
     PromptEncoder,
     VideoDecoder,
 )
 from ltx_pipelines.utils.helpers import assert_resolution, get_device
-from ltx_pipelines.utils.media_io import decode_audio_from_file, encode_video, load_image_and_preprocess
-from ltx_pipelines.utils.streaming import streaming_generate
+from ltx_pipelines.utils.media_io import encode_video, load_image_and_preprocess
+from ltx_pipelines.utils.streaming import streaming_generate_joint
 from ltx_pipelines.utils.types import OffloadMode
 
 logger = logging.getLogger(__name__)
 
 
-class A2VidStreamingPipeline:
-    """Single-stage streaming audio-to-video pipeline (causal AR generation).
+class TI2VidStreamingPipeline:
+    """Single-stage streaming text/image-to-video+audio pipeline (causal AR).
 
     The pretrained LTX-2 (full, non-distilled) checkpoint is used as the causal
-    model. Audio is a frozen control signal; video is generated chunk-by-chunk
-    with a sliding window, sink, and TwinCache (see
-    :func:`ltx_pipelines.utils.streaming.streaming_generate`).
+    model. Video and audio are generated chunk-by-chunk in lockstep, each with a
+    sliding window + TwinCache history (see
+    :func:`ltx_pipelines.utils.streaming.streaming_generate_joint`).
     """
 
     def __init__(
@@ -98,13 +111,6 @@ class A2VidStreamingPipeline:
             registry=registry,
             alloc_trim_strategy=alloc_trim_strategy,
         )
-        self.audio_conditioner = AudioConditioner(
-            checkpoint_path=checkpoint_path,
-            dtype=self.dtype,
-            device=self.device,
-            registry=registry,
-            alloc_trim_strategy=alloc_trim_strategy,
-        )
         self.stage = DiffusionStage.from_checkpoint(
             checkpoint_path=checkpoint_path,
             dtype=self.dtype,
@@ -123,6 +129,13 @@ class A2VidStreamingPipeline:
             registry=registry,
             alloc_trim_strategy=alloc_trim_strategy,
         )
+        self.audio_decoder = AudioDecoder(
+            checkpoint_path=checkpoint_path,
+            dtype=self.dtype,
+            device=self.device,
+            registry=registry,
+            alloc_trim_strategy=alloc_trim_strategy,
+        )
 
     def __call__(  # noqa: PLR0913
         self,
@@ -135,12 +148,8 @@ class A2VidStreamingPipeline:
         frame_rate: float,
         num_inference_steps: int,
         images: list[ImageConditioningInput],
-        audio_path: str,
-        audio_start_time: float = 0.0,
-        audio_max_duration: float | None = None,
         window_chunks: int = 4,
         chunk_frames: int = 1,
-        audio_lookahead: int | None = None,
         use_kv_cache: bool = False,
         causal_cross_attn: bool = True,
         cross_attn_lookahead_sec: float = 0.0,
@@ -148,14 +157,15 @@ class A2VidStreamingPipeline:
         enhance_prompt: bool = False,
         sigmas: torch.Tensor | None = None,
     ) -> tuple[Iterator[torch.Tensor], Audio]:
-        """Generate a streaming causal A2V video. Returns (video_frames, audio).
+        """Generate a streaming causal TI2V clip. Returns ``(video_frames, audio)``.
 
-        ``images[0]`` (frame_idx 0) is the sink reference. Audio is returned as
-        the (frozen) input audio, matching the standard A2V convention.
+        ``images[0]`` (frame_idx 0) is the sink reference. Audio is *generated*
+        jointly with the video (no audio input); both modalities are produced
+        chunk-by-chunk with bounded O(window) per-step memory.
         """
         assert_resolution(height=height, width=width, is_two_stage=False)
         if not images:
-            raise ValueError("A2VidStreamingPipeline requires a reference image (frame_idx=0) as the sink.")
+            raise ValueError("TI2VidStreamingPipeline requires a reference image (frame_idx=0) as the sink.")
         if window_chunks < 1:
             raise ValueError(f"window_chunks must be >= 1, got {window_chunks}")
         if chunk_frames < 1:
@@ -165,7 +175,7 @@ class A2VidStreamingPipeline:
         noiser = GaussianNoiser(generator=generator)
         dtype = self.dtype
 
-        # Text context (negative unused — no CFG in milestone 1, SimpleDenoiser logic).
+        # Text context (negative unused — no CFG in M1, SimpleDenoiser logic).
         ctx_p, _ = self.prompt_encoder(
             [prompt, negative_prompt],
             enhance_first_prompt=enhance_prompt,
@@ -189,42 +199,33 @@ class A2VidStreamingPipeline:
             )
         )  # (1, C, F, H_lat, W_lat)
 
-        # Frozen audio control: full audio latent, sliced per AR chunk inside the loop.
-        audio_max_duration = audio_max_duration if audio_max_duration is not None else num_frames / frame_rate
-        decoded_audio = decode_audio_from_file(audio_path, self.device, audio_start_time, audio_max_duration)
-        if decoded_audio is None:
-            raise ValueError(f"Failed to decode audio from {audio_path}.")
-        audio_latent_full = self.audio_conditioner(lambda enc: vae_encode_audio(decoded_audio, enc, None))
-
         sigmas = (sigmas if sigmas is not None else self._scheduler.execute(steps=num_inference_steps)).to(
             dtype=torch.float32, device=self.device
         )
 
         pixel_shape = VideoPixelShape(batch=1, frames=num_frames, height=height, width=width, fps=frame_rate)
         v_shape = VideoLatentShape.from_pixel_shape(pixel_shape)
+        a_shape = AudioLatentShape.from_video_pixel_shape(pixel_shape)
         video_tools_full = VideoLatentTools(VideoLatentPatchifier(patch_size=1), v_shape, frame_rate)
+        audio_tools_full = AudioLatentTools(AudioPatchifier(patch_size=1), a_shape)
         num_generated_latent_frames = v_shape.frames - 1  # frame 0 is the sink
         if num_generated_latent_frames <= 0:
             raise ValueError(f"num_frames={num_frames} yields no frames to generate beyond the sink.")
 
-        if audio_lookahead is None:
-            audio_lookahead = math.ceil(200.0 / frame_rate)
-
         # Generation runs under the transformer's model context (DiT required);
-        # decode uses a separate VideoDecoder and runs outside it.
+        # decode uses separate decoders and runs outside it.
         stepper = EulerDiffusionStep()
         with self.stage.model_context() as transformer:
             if use_kv_cache:
-                from ltx_pipelines.utils.streaming import streaming_generate_cached
+                from ltx_pipelines.utils.streaming import streaming_generate_joint_cached
 
-                full_latent = streaming_generate_cached(
+                full_video_latent, full_audio_latent = streaming_generate_joint_cached(
                     sigmas=sigmas,
                     num_generated_latent_frames=num_generated_latent_frames,
                     chunk_frames=chunk_frames,
                     window_chunks=window_chunks,
                     video_tools_full=video_tools_full,
-                    audio_latent_full=audio_latent_full,
-                    audio_lookahead=audio_lookahead,
+                    audio_tools_full=audio_tools_full,
                     sink_latent_unpatchified=sink_latent,
                     v_context=v_context_p,
                     a_context=a_context_p,
@@ -237,14 +238,13 @@ class A2VidStreamingPipeline:
                     cross_attn_lookahead_sec=cross_attn_lookahead_sec,
                 )
             else:
-                full_latent = streaming_generate(
+                full_video_latent, full_audio_latent = streaming_generate_joint(
                     sigmas=sigmas,
                     num_generated_latent_frames=num_generated_latent_frames,
                     chunk_frames=chunk_frames,
                     window_chunks=window_chunks,
                     video_tools_full=video_tools_full,
-                    audio_latent_full=audio_latent_full,
-                    audio_lookahead=audio_lookahead,
+                    audio_tools_full=audio_tools_full,
                     sink_latent_unpatchified=sink_latent,
                     v_context=v_context_p,
                     a_context=a_context_p,
@@ -257,11 +257,9 @@ class A2VidStreamingPipeline:
                     cross_attn_lookahead_sec=cross_attn_lookahead_sec,
                 )
 
-        decoded_video = self.video_decoder(full_latent, tiling_config, generator=generator)
-        original_audio = Audio(
-            waveform=decoded_audio.waveform.squeeze(0), sampling_rate=decoded_audio.sampling_rate
-        )
-        return decoded_video, original_audio
+        decoded_video = self.video_decoder(full_video_latent, tiling_config, generator=generator)
+        decoded_audio = self.audio_decoder(full_audio_latent)
+        return decoded_video, decoded_audio
 
 
 @torch.inference_mode()
@@ -270,77 +268,50 @@ def main() -> None:
     params = resolve_cli_params()
     parser = default_1_stage_arg_parser(params=params)
     parser.add_argument(
-        "--audio-path",
-        type=str,
-        required=True,
-        help="Path to the audio file used to drive the video generation (frozen control signal).",
-    )
-    parser.add_argument(
-        "--audio-start-time",
-        type=float,
-        default=0.0,
-        help="Start time in seconds to read audio from (default: 0.0).",
-    )
-    parser.add_argument(
-        "--audio-max-duration",
-        type=float,
-        default=None,
-        help="Maximum audio duration in seconds. Defaults to the video duration (num_frames / frame_rate).",
-    )
-    parser.add_argument(
         "--window-chunks",
         type=int,
         default=4,
         help="Sliding-window rolling-history size in AR chunks (TwinCache FIFO cap; "
-        "the sink and the first generated chunk are persistent and not counted). Default 4.",
+        "the video sink and the first generated video chunk are persistent and not "
+        "counted). Audio uses the same cap for its own FIFO history. Default 4.",
     )
     parser.add_argument(
         "--chunk-frames",
         type=int,
         default=1,
-        help="Latent video frames generated per AR step (default 1 = finest streaming granularity).",
-    )
-    parser.add_argument(
-        "--audio-lookahead",
-        type=int,
-        default=None,
-        help="Extra audio latent frames visible ahead of the current chunk's end "
-        "(default ceil(200/fps), one video-frame's worth).",
+        help="Latent video frames generated per AR step (default 1 = finest streaming "
+        "granularity). The time-aligned audio latent frames for each chunk are generated "
+        "in lockstep (~8/fps*25 audio frames per video latent frame).",
     )
     parser.add_argument(
         "--use-kv-cache",
         action="store_true",
-        help="Milestone 2: use the KV-cache + RoPE-repositioning path (faster; history "
-        "K/V are reused from each chunk's own denoising pass per Vidu S1 §2.3.1, so "
-        "results differ slightly from the default full-recompute path — run the "
-        "parity/smoke test before trusting). Default off (M1 latent-level TwinCache).",
+        help="M2: use the KV-cache + RoPE-repositioning path for BOTH video and audio "
+        "self-attention (faster; history K/V are reused from each chunk's own denoising "
+        "pass per Vidu S1 §2.3.1, so results differ slightly from the default "
+        "full-recompute path — run the joint parity/smoke test before trusting). Default "
+        "off (M1 latent-level TwinCache).",
     )
     parser.add_argument(
         "--causal-cross-attn",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Apply a time-causal mask to the AV cross-attention (a2v video->audio and "
-        "v2a audio->video), per Vidu S1 §2.3 'causal attention mask on video-audio "
-        "tokens'. The mask is built from LTX-2's shared seconds-axis cross-attn RoPE "
-        "positions, so video frame i only attends audio up to its own time. Default ON "
-        "for paper-faithful streaming causality — the base LTX-2 model is bidirectionally "
-        "trained, so this is a train/test mismatch (this is a conceptual reproduction, not "
-        "tuned for runtime quality); pass --no-causal-cross-attn to revert to full "
-        "bidirectional cross-attention.",
+        "v2a audio->video), per Vidu S1 §2.3. Default ON for paper-faithful streaming "
+        "causality; pass --no-causal-cross-attn to revert to full bidirectional "
+        "cross-attention.",
     )
     parser.add_argument(
         "--cross-attn-lookahead-seconds",
         type=float,
         default=0.0,
         help="Seconds of future audio a video frame may attend to under --causal-cross-attn "
-        "(0.0 = strict causal, paper-faithful 'conditions up to frame i'). A small positive "
-        "value (e.g. one video frame = 8/fps) can mitigate lip-sync regression on the "
-        "bidirectionally-trained base model. Independent of --audio-lookahead (which "
-        "controls how much future audio is in the slice at all).",
+        "(0.0 = strict causal). In TI2V there is no frozen 'future audio' beyond the "
+        "current window, so this only relaxes causality within the visible window.",
     )
     args = parser.parse_args()
 
-    pipeline = A2VidStreamingPipeline(
+    pipeline = TI2VidStreamingPipeline(
         checkpoint_path=args.checkpoint_path,
         gemma_root=args.gemma_root,
         loras=tuple(args.lora) if args.lora else (),
@@ -360,12 +331,8 @@ def main() -> None:
         frame_rate=args.frame_rate,
         num_inference_steps=args.num_inference_steps,
         images=args.images,
-        audio_path=args.audio_path,
-        audio_start_time=args.audio_start_time,
-        audio_max_duration=args.audio_max_duration,
         window_chunks=args.window_chunks,
         chunk_frames=args.chunk_frames,
-        audio_lookahead=args.audio_lookahead,
         use_kv_cache=args.use_kv_cache,
         causal_cross_attn=args.causal_cross_attn,
         cross_attn_lookahead_sec=args.cross_attn_lookahead_seconds,

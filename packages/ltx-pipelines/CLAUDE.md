@@ -26,6 +26,7 @@ Inference pipelines for LTX-2 audio-video generation. Depends on `ltx-core` for 
 | `ICLoraPipeline` | `ic_lora.py` | 2 | Distilled only | Euler | Video-to-video with IC-LoRA control |
 | `LipDubPipeline` | `lipdub.py` | 2 | Distilled only | Euler | Lip dubbing with IC-LoRA + audio ref conditioning |
 | `RetakePipeline` | `retake.py` | 1 | Full or distilled | Euler | Video region regeneration |
+| `TI2VidStreamingPipeline` | `ti2vid_streaming.py` | 1 | Full | Euler | Streaming causal video+audio (joint generation) |
 
 ## Guidance
 
@@ -82,6 +83,20 @@ Guided denoisers batch all guidance passes into a **single transformer call**: s
 - **Keyframe**: Uses `image_conditionings_by_adding_guiding_latent` in both stages (all frames as keyframe guidance, no replacement) -- unlike TI2Vid which uses `combined_image_conditionings` (frame_idx=0 replaces, others guide).
 - **Retake**: `TemporalRegionMask` for selective time-window regeneration. `regenerate_video`/`regenerate_audio` flags. Conditional distilled/full behavior.
 - **Distilled**: Single `self.stage` reused for both stages (not `stage_1`/`stage_2`).
+
+## Streaming causal pipelines (experimental)
+
+`TI2VidStreamingPipeline` (`ti2vid_streaming.py`) is a training-free reproduction of Vidu S1 §2.3 streaming inference on top of the pretrained *bidirectional* LTX-2 checkpoint (used as-is as the "causal model", no training). Primitives live in `utils/streaming.py`; the M2 KV-cache lives in `ltx-core` (`model/transformer/streaming_cache.py`, `streaming_model.py`, the `_stream_cached_forward` path in `attention.py`).
+
+TI2V has no audio input — video **and** audio are generated in lockstep. Each video AR chunk also produces its time-aligned audio frames; audio keeps its own sliding-window FIFO history (no sink / no persistent anchor, since audio has no image conditioning) so per-step memory stays O(window) for both modalities.
+
+Shared mechanics: persistent video reference context = encoded first-frame "sink" + first generated video chunk (always clean, never evicted); latent-level TwinCache (noisy snapshot at a mid denoising step, clean at the final step; frozen via per-token `denoise_mask` + `latent == clean_latent` → Euler velocity 0); block-causal self-attention mask on each modality's temporal axis; time-causal video↔audio cross-attention mask (`--causal-cross-attn`, default on). CLI flags: `--window-chunks` (FIFO cap), `--chunk-frames` (latent video frames per AR step), `--causal-cross-attn` / `--cross-attn-lookahead-seconds`, `--use-kv-cache` (M2).
+
+Two execution paths:
+- **M1 (default)** — latent TwinCache, full per-step recompute of history features. The correct, recommended path.
+- **M2 (`--use-kv-cache`)** — per-block KV cache + RoPE repositioning. Caches **both** video self-attn (`attn1`, 1-frame sink + persistent first chunk) and audio self-attn (`audio_attn1`, no-sink FIFO) via `CausalStreamingModel(..., cache_audio=True)`. Faster, but **conceptual/unvalidated** — run the parity test before trusting. Production bidirectional pipelines are unaffected (`attn1`/`audio_attn1.stream_cache` stay `None` unless a streaming driver attaches them).
+
+Validation: `tests/test_streaming_joint.py` (pure-tensor, no checkpoint) + `tests/test_streaming_joint_parity.py` (GPU integration: single-chunk M1≡M2 parity + multi-chunk smoke, both modalities). Run the parity test in a GPU env before trusting M2. These are conceptual reproductions, not quality-tuned (the base model is bidirectionally trained, so the causal masks are a train/test mismatch).
 
 ## Image conditioning helpers (`utils/helpers.py`)
 

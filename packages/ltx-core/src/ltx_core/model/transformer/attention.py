@@ -622,8 +622,8 @@ class Attention(torch.nn.Module):
         if all_perturbed:
             return self.to_out(self.to_v(context))
 
-        hw = cache.tokens_per_frame  # sink tokens (1 frame)
-        v_cur = self.to_v(context)  # [sink | current]
+        hw = cache.sink_tokens  # sink tokens in the modality (1 video frame; 0 for audio)
+        v_cur = self.to_v(context)  # [sink | current] (or [current] when hw == 0)
         q = self.to_q(x)
         k_cur = self.to_k(context)
         q = self.q_norm(q)

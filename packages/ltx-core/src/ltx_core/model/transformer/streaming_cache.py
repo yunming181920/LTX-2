@@ -21,10 +21,24 @@ final step) with the freshly-computed current-chunk K/V, then re-applies RoPE
 to the assembled keys using the window-relative ``window_pe`` (RoPE
 repositioning).
 
-Only **video self-attention** is cached. The sink (first-frame latent) is NOT
-cached — it lives in the modality and is recomputed each step (its K/V depend
-on the per-chunk audio slice via AV cross-attn). Audio↔video cross-attention
-uses frozen audio (recomputed cheaply), so it needs no cache.
+Only **self-attention** is cached. For the video modality the sink (first-frame
+latent) is NOT cached — it lives in the modality and is recomputed each step (its
+K/V depend on the per-chunk audio slice via AV cross-attn). Audio↔video
+cross-attention is recomputed each step (not KV-cached), so it needs no cache.
+
+Two modality flavours, selected at construction:
+
+  * **Video** (``sink_tokens = tokens_per_frame``, ``persistent_first = True``):
+    the cached attention layout is ``[sink | first | history | current]`` — the
+    sink tokens (1 latent frame) live in the modality, and the first generated
+    chunk occupies the permanent ``_first`` slot (Vidu S1 §2.3.1 persistent
+    reference). This is the original A2V/ti2v-video behaviour.
+  * **Audio** (``sink_tokens = 0``, ``persistent_first = False``): audio has no
+    image conditioning, so there is no sink and no permanent first chunk — every
+    chunk goes to the rolling FIFO ring, and the cached layout collapses to
+    ``[history | current]`` (an empty ``[0:0]`` sink slice). Used by the joint
+    streaming TI2V path (M2), where audio is *generated* in lockstep and its
+    self-attention must also be cached for O(window) memory.
 """
 
 from __future__ import annotations
@@ -60,10 +74,16 @@ class StreamingKVCache:
          commit fills the permanent slot; later commits append to the ring.
     """
 
-    def __init__(self, window_chunks: int) -> None:
+    def __init__(self, window_chunks: int, *, sink_tokens: int = 0, persistent_first: bool = False) -> None:
         if window_chunks < 1:
             raise ValueError(f"window_chunks must be >= 1, got {window_chunks}")
+        # Modality flavour (fixed at construction):
+        #  * video: sink_tokens = one latent frame, persistent_first = True.
+        #  * audio: sink_tokens = 0, persistent_first = False (pure FIFO ring).
+        self.sink_tokens = sink_tokens
+        self.persistent_first = persistent_first
         # Persistent reference (first generated chunk, clean, never evicted).
+        # Only used when persistent_first=True (video); audio leaves this None.
         self._first: tuple[torch.Tensor, torch.Tensor] | None = None
         # Rolling history of subsequent chunks (TwinCache entries).
         self._entries: deque[_ChunkKV] = deque(maxlen=window_chunks)
@@ -141,16 +161,18 @@ class StreamingKVCache:
     def commit(self) -> None:
         """Finalize the pending chunk.
 
-        The first committed chunk becomes the permanent reference slot (clean
-        snapshot; Vidu S1's persistent reference context). Subsequent chunks
-        are appended to the FIFO ring as TwinCache entries.
+        For a ``persistent_first`` cache (video), the first committed chunk
+        becomes the permanent reference slot (clean snapshot; Vidu S1's
+        persistent reference context) and later chunks append to the FIFO ring.
+        For a non-persistent cache (audio, no sink/anchor), every chunk appends
+        straight to the FIFO ring.
         """
         if self._pending.noisy is None or self._pending.clean is None:
             # Need both snapshots; if one is missing, duplicate the other.
             kv = self._pending.clean or self._pending.noisy
             self._pending = _ChunkKV(noisy=kv, clean=kv)
-        if self._first is None:
-            # Persistent reference: always the clean snapshot.
+        if self.persistent_first and self._first is None:
+            # Persistent reference: always the clean snapshot (video only).
             self._first = self._pending.clean
         else:
             self._entries.append(self._pending)
