@@ -48,6 +48,65 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def _get_submodule(model: nn.Module, dotted_path: str) -> nn.Module:
+    """Resolve a dotted attribute path (e.g. 'model.vision_tower.embeddings') to a submodule."""
+    obj = model
+    for attr in dotted_path.split("."):
+        obj = getattr(obj, attr)
+    return obj  # type: ignore[return-value]
+
+
+def _materialize_meta_params(model: nn.Module, device: torch.device, blocks_attr: str) -> None:
+    """Move any non-block params/buffers still on meta to ``device`` (zero-filled).
+
+    Checkpoints sometimes omit task-irrelevant submodules (e.g. Gemma3's
+    vision_tower when used purely as a text encoder). The unloaded tensors stay
+    on the meta device, which makes ``nn.Module.device`` report ``meta`` and
+    crashes code that allocates tensors via ``model.device``. Filling them with
+    zeros on the compute device restores a sane device without loading real
+    weights — the corresponding code paths are never hit in text-only use.
+    """
+    blocks_path = blocks_attr.split(".")
+    try:
+        blocks_module = model
+        for attr in blocks_path:
+            blocks_module = getattr(blocks_module, attr)
+        block_param_ids = set()
+        for block in blocks_module:
+            for p in block.parameters():
+                block_param_ids.add(id(p))
+            for b in block.buffers():
+                block_param_ids.add(id(b))
+    except AttributeError:
+        block_param_ids = set()
+
+    # Collect the qualified names of submodules whose params are still on meta
+    # (not loaded from checkpoint) so we can materialize them on the compute device.
+    meta_param_paths: list[tuple[str, str]] = []
+    for name, module in model.named_modules():
+        for pname, p in module.named_parameters(recurse=False):
+            if p.is_meta:
+                meta_param_paths.append((name, pname))
+        for bname, b in module.named_buffers(recurse=False):
+            if b.is_meta:
+                meta_param_paths.append((name, bname))
+
+    for mod_name, member_name in meta_param_paths:
+        module = model if mod_name == "" else _get_submodule(model, mod_name)
+        existing = dict(module.named_parameters(recurse=False))
+        existing.update(dict(module.named_buffers(recurse=False)))
+        old = existing[member_name]
+        if id(old) in block_param_ids:
+            continue
+        replacement = torch.empty(old.shape, dtype=old.dtype, device=device)
+        if old.__class__.__name__ == "Parameter":
+            module.register_parameter(
+                member_name, torch.nn.Parameter(replacement, requires_grad=False)
+            )
+        else:
+            module.register_buffer(member_name, replacement)
+
 DISK_CPU_SLOTS = 2
 _DEFAULT_GPU_SLOTS = 2
 _PREFETCH_DEPTH = 2
@@ -253,6 +312,15 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
             non_block_loras = [src.as_state_dict_with_strength() for src in lora_sources]
 
         self._load_non_block_weights(meta_model, non_block_keys, device, dtype, non_block_loras)
+
+        # Materialize any non-block parameters/buffers still on the meta device onto
+        # the compute device. Checkpoints may omit weights that are unused for a
+        # given task (e.g. Gemma3's vision_tower in a text-only encode), and
+        # leaving them on meta makes nn.Module.device report ``meta`` — which
+        # breaks any tensor created via ``model.device`` (attention masks, cache
+        # positions, etc.). They are filled with zeros: text-only forward never
+        # routes through them, and vision-tower code paths are not exercised here.
+        _materialize_meta_params(meta_model, device, self.blocks_attr)
 
         sync = create_stream_sync(device)
         gpu_pool = BufferPool(source.slot_nbytes, gpu_slots_count, device, reuse_barrier=sync.reuse_barrier)

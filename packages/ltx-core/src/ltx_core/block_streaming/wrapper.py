@@ -46,6 +46,18 @@ class BlockStreamingWrapper(nn.Module):
     def num_blocks(self) -> int:
         return self._model.num_blocks
 
+    @property
+    def device(self) -> torch.device:
+        """The compute device for this wrapper.
+
+        The wrapped model may have uninitialized (meta) parameters (e.g. a vision
+        tower whose weights are absent from the checkpoint), which makes the
+        stock ``.device`` property report ``meta``. Code that creates input
+        tensors via ``model.device`` would then land them on meta and crash on
+        the first ``.to()``. Report the real compute device instead.
+        """
+        return self._target_device
+
     # ------------------------------------------------------------------
     # Hook registration
     # ------------------------------------------------------------------

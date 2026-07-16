@@ -27,6 +27,7 @@ wandb/
 *.pt
 *.safetensors
 *.sft
+models/
 
 # Media files
 *.exr

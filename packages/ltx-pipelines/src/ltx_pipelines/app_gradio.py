@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import logging
 
+import torch
+
 from ltx_core.model.video_vae.tiling import TilingConfig
 from ltx_pipelines.interactive_session import InteractiveStreamingSession
 from ltx_pipelines.utils.args import new_video_gen_arg_parser, resolve_cli_params
@@ -145,16 +147,36 @@ def main() -> None:
         if action.dest in ("prompt", "output_path"):
             action.required = False
             action.default = ""
-    parser.add_argument("--host", default="127.0.0.1", help="Gradio server host.")
+    parser.add_argument("--host", default="0.0.0.0", help="Gradio server host (0.0.0.0 for LAN access).")
     parser.add_argument("--port", type=int, default=7860, help="Gradio server port.")
     parser.add_argument("--share", action="store_true", help="Create a public Gradio share link.")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="GPU device for the DiT + VAEs (e.g. 'cuda:0'). Defaults to cuda:0.",
+    )
+    parser.add_argument(
+        "--text-encoder-device",
+        type=str,
+        default=None,
+        help=(
+            "GPU device for the Gemma text encoder (e.g. 'cuda:1'). Defaults to --device. "
+            "Set to a different GPU to split the 12B text encoder from the 22B DiT."
+        ),
+    )
     args = parser.parse_args()
+
+    dit_device = torch.device(args.device) if args.device else None
+    text_device = torch.device(args.text_encoder_device) if args.text_encoder_device else None
 
     global SESSION  # noqa: PLW0603 — single shared session for a single-GPU demo
     SESSION = InteractiveStreamingSession(
         checkpoint_path=args.checkpoint_path,
         gemma_root=args.gemma_root,
         loras=tuple(args.lora) if args.lora else (),
+        device=dit_device,
+        text_encoder_device=text_device,
         quantization=args.quantization,
         compilation_config=args.compile,
         offload_mode=args.offload_mode,

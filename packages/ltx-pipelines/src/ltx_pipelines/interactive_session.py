@@ -40,6 +40,7 @@ import os
 import tempfile
 import threading
 from collections.abc import Generator
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 
 import numpy as np
@@ -114,21 +115,40 @@ class LivePromptEncoder:
         prompt_encoder: PromptEncoder,
         enhance_prompt_image: str | None = None,
         enhance_prompt_seed: int = 42,
+        target_device: torch.device | None = None,
     ) -> None:
         self._prompt_encoder = prompt_encoder
         self._enhance_image = enhance_prompt_image
         self._enhance_seed = enhance_prompt_seed
-        self._text_encoder = prompt_encoder._build_text_encoder()
+        self._target_device = target_device  # context tensors are moved here before use
+        # The embeddings processor is small; build it resident on the encoder device.
         self._embeddings_processor = prompt_encoder._build_embeddings_processor()
+        # The text encoder (Gemma, 12B) is built lazily in start() so the caller
+        # can choose a streaming (offload) path when it would not fit resident.
+        self._text_encoder = None
+        self._text_encoder_ctx: AbstractContextManager | None = None
         self._last_prompt: str | None = None
         self._last_context: tuple[torch.Tensor, torch.Tensor] | None = None
+
+    def start(self) -> None:
+        """Build the text encoder, using the streaming path when offload is enabled."""
+        if self._text_encoder is not None:
+            return
+        pe = self._prompt_encoder
+        if pe._offload_mode != OffloadMode.NONE:
+            # Streaming path: weights stay in pinned CPU memory, layers prefetched to GPU.
+            self._text_encoder_ctx = pe._text_encoder_ctx()
+            self._text_encoder = self._text_encoder_ctx.__enter__()
+        else:
+            self._text_encoder = pe._build_text_encoder()
 
     def encode(self, prompt: str, *, enhance: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
         """Encode a single positive prompt → ``(v_context, a_context)``.
 
         No CFG in the streaming M1 path (negative prompt unused), so only the
         positive prompt is encoded. ``enhance`` rewrites the prompt via Gemma
-        (``generate_enhanced_prompt``) before encoding.
+        (``generate_enhanced_prompt``) before encoding. Context tensors are moved
+        to ``target_device`` (the DiT device) so they can feed a cross-GPU pipeline.
         """
         if prompt == self._last_prompt and self._last_context is not None and not enhance:
             return self._last_context
@@ -142,15 +162,24 @@ class LivePromptEncoder:
             ]
         raw_outputs = self._text_encoder.encode(prompts)
         (out,) = [self._embeddings_processor.process_hidden_states(hs, mask) for hs, mask in raw_outputs]
-        context = (out.video_encoding, out.audio_encoding)
+        v_ctx, a_ctx = out.video_encoding, out.audio_encoding
+        if self._target_device is not None:
+            v_ctx = v_ctx.to(self._target_device)
+            a_ctx = a_ctx.to(self._target_device)
+        context = (v_ctx, a_ctx)
         self._last_prompt = prompt
         self._last_context = context
         return context
 
     def free(self) -> None:
-        for model in (self._text_encoder, self._embeddings_processor):
-            if model is not None:
-                model.to("meta")
+        if self._text_encoder_ctx is not None:
+            self._text_encoder_ctx.__exit__(None, None, None)
+            self._text_encoder_ctx = None
+            self._text_encoder = None
+        elif self._text_encoder is not None:
+            self._text_encoder.to("meta")
+        if self._embeddings_processor is not None:
+            self._embeddings_processor.to("meta")
         cleanup_memory()
 
 
@@ -184,6 +213,7 @@ class InteractiveStreamingSession:
         gemma_root: str,
         loras: list[LoraPathStrengthAndSDOps],
         device: torch.device | None = None,
+        text_encoder_device: torch.device | None = None,
         quantization: QuantizationPolicy | None = None,
         registry: Registry | None = None,
         compilation_config: CompilationConfig | None = None,
@@ -192,12 +222,15 @@ class InteractiveStreamingSession:
     ) -> None:
         self.dtype = torch.bfloat16
         self.device = device or get_device()
+        # The text encoder (Gemma, 12B) may live on a separate GPU from the DiT.
+        # Encoded context tensors are moved to ``self.device`` before feeding the DiT.
+        self.text_encoder_device = text_encoder_device or self.device
         self._scheduler = LTX2Scheduler()
         self.prompt_encoder = PromptEncoder(
             checkpoint_path=checkpoint_path,
             gemma_root=gemma_root,
             dtype=self.dtype,
-            device=self.device,
+            device=self.text_encoder_device,
             registry=registry,
             offload_mode=offload_mode,
             alloc_trim_strategy=alloc_trim_strategy,
@@ -265,7 +298,10 @@ class InteractiveStreamingSession:
             self.prompt_encoder,
             enhance_prompt_image=enhance_prompt_image,
             enhance_prompt_seed=enhance_prompt_seed,
+            target_device=self.device if self.text_encoder_device != self.device else None,
         )
+        # Build the text encoder (streaming if offload is enabled) before first use.
+        self._live_encoder.start()
         # VAEs: build once via the decoders' configured builders and hold.
         self._video_vae = self.video_decoder._decoder_builder.build(
             device=self.device, dtype=self.dtype
