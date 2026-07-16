@@ -181,11 +181,14 @@ uv run python -m ltx_pipelines.app_gradio \
     --gemma-root models/gemma-3-12b
 ```
 
-Open the printed URL, upload a reference image (the sink), set the initial prompt, hit
-**Generate**, and edit the live prompt while it streams. `--host/--port/--share` control
-serving. New files: `ltx_pipelines/utils/streaming_interactive.py` (generator driver with
-a per-chunk context resolver), `ltx_pipelines/interactive_session.py` (session + `PromptSlot`
-+ `LivePromptEncoder` + incremental decode), `app_gradio.py` (UI).
+Open the printed URL, upload a reference image (the sink), enter **one prompt per line**,
+and hit **Generate** — all prompts are pre-encoded once and cached, then the clip streams
+from the first. Press **Next Prompt** while it streams to switch to the next prompt (a clean
+cross-attention swap applied at the next chunk; until then it keeps running on the current
+prompt; the last clamps, no loop). `--host/--port/--share` control serving. New files:
+`ltx_pipelines/utils/streaming_interactive.py` (generator driver with a per-chunk context
+resolver), `ltx_pipelines/interactive_session.py` (session + `PromptBank` + `LivePromptEncoder`
++ incremental decode), `app_gradio.py` (UI).
 
 Notes:
 - `fp8-scaled-mm` is for **pre-quantized** fp8 checkpoints (on-disk `F8_E4M3` weight +
@@ -385,10 +388,11 @@ uv run python -m ltx_pipelines.app_gradio \
     --gemma-root models/gemma-3-12b
 ```
 
-打开打印的 URL，上传参考图（sink），设好初始提示词，点 **Generate**，然后在流式过程中编辑
-live prompt 即可。`--host/--port/--share` 控制服务。新增文件：`ltx_pipelines/utils/streaming_interactive.py`
-（带逐 chunk context resolver 的生成器驱动）、`ltx_pipelines/interactive_session.py`
-（会话 + `PromptSlot` + `LivePromptEncoder` + 增量解码）、`app_gradio.py`（UI）。
+打开打印的 URL，上传参考图（sink），**每行输入一条提示词**，点 **Generate** —— 所有提示词会先被
+预编码一次并缓存，然后从第一条开始流式生成。流式过程中点 **Next Prompt** 切换到下一条（在下一个 chunk
+边界做一次干净的 cross-attention 切换；不切换时一直以当前提示词继续；最后一条不循环）。`--host/--port/--share`
+控制服务。新增文件：`ltx_pipelines/utils/streaming_interactive.py`（带逐 chunk context resolver 的生成器驱动）、
+`ltx_pipelines/interactive_session.py`（会话 + `PromptBank` + `LivePromptEncoder` + 增量解码）、`app_gradio.py`（UI）。
 
 注意事项：
 - `fp8-scaled-mm` 用于 **已量化** 的 fp8 checkpoint（盘上是 `F8_E4M3` weight + `.weight_scale`）；

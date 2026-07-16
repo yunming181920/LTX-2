@@ -1,20 +1,23 @@
-"""Interactive streaming session for LTX-2 TI2V — live prompt injection + streaming A/V.
+"""Interactive streaming session for LTX-2 TI2V — pre-encoded prompt playlist + streaming A/V.
 
 Wraps :class:`ltx_pipelines.ti2vid_streaming.TI2VidStreamingPipeline`'s building blocks
 into a **long-lived** session so the 22B DiT, the 12B Gemma text encoder, and the
-audio/video VAEs are built **once** and reused across chunks, across prompt changes,
+audio/video VAEs are built **once** and reused across chunks, across prompt switches,
 and across multiple generations (no reload per chunk or per prompt).
 
 Two responsibilities on top of the model lifecycle:
 
-  * **Live prompt injection** (:class:`PromptSlot`). Text conditioning is
+  * **Pre-encoded prompt playlist** (:class:`PromptBank`). Text conditioning is
     cross-attention (see :mod:`ltx_pipelines.utils.streaming_interactive`), so
-    changing the prompt mid-stream only rewrites the cross-attention conditioning of
+    switching the prompt mid-stream only rewrites the cross-attention conditioning of
     subsequent chunks and leaves the cached self-attention history / sink untouched.
-    :meth:`InteractiveStreamingSession.submit_prompt` queues a new prompt; the run
-    loop drains the queue at each chunk boundary and re-encodes via the kept-alive
-    Gemma (:class:`LivePromptEncoder`, which caches the last prompt so an unchanged
-    prompt is not re-encoded).
+    :meth:`InteractiveStreamingSession.prefetch_prompts` pre-encodes a list of prompts
+    once (single batched Gemma forward via :class:`LivePromptEncoder`) and caches them
+    in the bank; :meth:`InteractiveStreamingSession.advance_prompt` (the UI's **Next
+    Prompt** button) queues a one-step advance that the run loop applies at the next
+    chunk boundary, then returns the bank's current cached context (no re-encode per
+    chunk). Generation starts on prompt #1 and keeps running on the current prompt
+    until the next advance; the last prompt is a hard clamp (no loop).
   * **Streaming output**. :meth:`InteractiveStreamingSession.run` is a generator
     that drives :func:`iter_streaming_chunks_joint` and, after each AR chunk,
     decodes the growing latent **prefix** through the kept-alive VAEs and re-encodes
@@ -29,8 +32,8 @@ Design notes / trade-offs (see the plan for detail):
     overlap internally). Decoding only the new frame is a future optimization.
   * **M1 path only** (the recommended, correct path). An M2 interactive variant can
     reuse this decode/prompt layer later.
-  * **Single active generation**: one prompt slot, one GPU — not a multi-tenant
-    server. The queue holds at most one pending prompt (the latest wins).
+  * **Single active generation**: one playlist, one GPU — not a multi-tenant server.
+    Advances apply at most one per chunk; rapid Next clicks queue instead of skipping.
 """
 
 from __future__ import annotations
@@ -73,28 +76,72 @@ from ltx_pipelines.utils.types import OffloadMode
 logger = logging.getLogger(__name__)
 
 
-class PromptSlot:
-    """Thread-safe single-slot queue for the latest pending prompt.
+class PromptBank:
+    """Thread-safe ordered playlist of pre-encoded prompts.
 
-    The UI writes the live prompt textbox value here (`.change()`); the generation
-    loop drains it at each chunk boundary. At most one prompt is pending — a later
-    ``submit`` overwrites an earlier unread one (the newest prompt wins).
+    The UI hands :meth:`InteractiveStreamingSession.prefetch_prompts` a list of
+    prompts up front; each is encoded once (via :class:`LivePromptEncoder`) and
+    stored here as ``(prompt, (v_context, a_context))``. Generation starts at index
+    0 (the first prompt) and keeps returning that prompt's cached context every
+    chunk until an advance is applied. The UI's **Next Prompt** button calls
+    :meth:`request_advance`; the run loop applies at most one queued advance per AR
+    chunk via :meth:`drain_one_advance` (one step per click, so rapid double-clicks
+    queue instead of skipping a prompt). The last entry is a hard clamp — no loop.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._pending: str | None = None
+        self._entries: list[tuple[str, tuple[torch.Tensor, torch.Tensor]]] = []
+        self._index = 0
+        self._pending = 0  # queued advances not yet applied at a chunk boundary
 
-    def submit(self, prompt: str) -> None:
-        prompt = (prompt or "").strip()
+    def prefetch(self, entries: list[tuple[str, tuple[torch.Tensor, torch.Tensor]]]) -> int:
+        """Load a fresh pre-encoded playlist and reset to the first prompt."""
         with self._lock:
-            self._pending = prompt
+            self._entries = list(entries)
+            self._index = 0
+            self._pending = 0
+            return len(self._entries)
 
-    def drain(self) -> str | None:
+    def request_advance(self) -> None:
+        """Queue one advance for the next chunk boundary (clamped at the last entry)."""
         with self._lock:
-            p = self._pending
-            self._pending = None
-            return p
+            if self._index + self._pending < len(self._entries) - 1:
+                self._pending += 1
+
+    def drain_one_advance(self) -> bool:
+        """Apply at most one queued advance. Returns True if the index moved."""
+        with self._lock:
+            if self._pending > 0 and self._index < len(self._entries) - 1:
+                self._pending -= 1
+                self._index += 1
+                return True
+            # At the last entry: drop any leftover queued advances (clamped, no loop).
+            self._pending = 0
+            return False
+
+    def current_context(self) -> tuple[torch.Tensor, torch.Tensor]:
+        with self._lock:
+            return self._entries[self._index][1]
+
+    def current_prompt(self) -> str:
+        with self._lock:
+            return self._entries[self._index][0] if self._entries else ""
+
+    @property
+    def index(self) -> int:
+        with self._lock:
+            return self._index
+
+    @property
+    def total(self) -> int:
+        with self._lock:
+            return len(self._entries)
+
+    @property
+    def queued(self) -> int:
+        with self._lock:
+            return self._pending
 
 
 class LivePromptEncoder:
@@ -147,6 +194,34 @@ class LivePromptEncoder:
         self._last_context = context
         return context
 
+    def encode_many(
+        self, prompts: list[str], *, enhance: bool = False
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """Pre-encode a list of positive prompts → ``[(v_context, a_context), ...]``.
+
+        Runs a single batched Gemma forward (``text_encoder.encode`` batches) and
+        processes every row through the embeddings processor — the same path as
+        :meth:`encode`, just consuming all rows instead of the first. With
+        ``enhance``, each prompt is first rewritten via ``generate_enhanced_prompt``.
+        Used once at generation start to populate a :class:`PromptBank`.
+        """
+        if not prompts:
+            return []
+        to_encode = prompts
+        if enhance:
+            to_encode = [
+                generate_enhanced_prompt(
+                    self._text_encoder, p, self._enhance_image, seed=self._enhance_seed
+                )
+                for p in prompts
+            ]
+        raw_outputs = self._text_encoder.encode(to_encode)
+        contexts: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for hs, mask in raw_outputs:
+            out = self._embeddings_processor.process_hidden_states(hs, mask)
+            contexts.append((out.video_encoding, out.audio_encoding))
+        return contexts
+
     def free(self) -> None:
         for model in (self._text_encoder, self._embeddings_processor):
             if model is not None:
@@ -174,8 +249,10 @@ class InteractiveStreamingSession:
 
     Construct with the same config as :class:`TI2VidStreamingPipeline`, then
     :meth:`start` to build all models (kept resident), :meth:`run` (a generator) to
-    generate with live prompt injection + streaming output, and :meth:`stop` to free.
-    The live prompt is fed via :meth:`submit_prompt` (thread-safe).
+    generate over a pre-encoded prompt playlist + streaming output, and :meth:`stop`
+    to free. Prompts are pre-encoded via :meth:`prefetch_prompts` (called at the start
+    of :meth:`run`); the UI advances the playlist via :meth:`advance_prompt`
+    (thread-safe, safe during generation).
     """
 
     def __init__(
@@ -235,7 +312,7 @@ class InteractiveStreamingSession:
             alloc_trim_strategy=alloc_trim_strategy,
         )
 
-        self.prompt_slot = PromptSlot()
+        self.prompt_bank = PromptBank()
         self._live_encoder: LivePromptEncoder | None = None
         self._transformer_ctx = None
         self._transformer = None
@@ -294,12 +371,50 @@ class InteractiveStreamingSession:
             self._transformer = None
         self._started = False
 
-    # -- live prompt ---------------------------------------------------------
+    # -- prompt playlist -----------------------------------------------------
 
-    def submit_prompt(self, prompt: str) -> str:
-        """Queue a new prompt for the next chunk boundary. Returns the queued text."""
-        self.prompt_slot.submit(prompt)
-        return (prompt or "").strip()
+    def prefetch_prompts(self, prompts: list[str], *, enhance: bool = False) -> int:
+        """Pre-encode a list of prompts once and cache them in the bank.
+
+        Drops empty lines (order preserved), encodes all prompts in a single batched
+        Gemma forward via :meth:`LivePromptEncoder.encode_many`, loads them into the
+        :class:`PromptBank`, and resets the active prompt to the first one. Must be
+        called after :meth:`start` and before / at the start of :meth:`run`.
+        Returns the number of prompts cached.
+        """
+        if self._live_encoder is None:
+            raise RuntimeError("Session not started — call start() before prefetch_prompts().")
+        cleaned = [p.strip() for p in prompts if p and p.strip()]
+        if not cleaned:
+            raise ValueError("At least one non-empty prompt is required.")
+        contexts = self._live_encoder.encode_many(cleaned, enhance=enhance)
+        self.prompt_bank.prefetch(list(zip(cleaned, contexts)))
+        self._active_prompt = cleaned[0]
+        logger.info("Pre-encoded %d prompts; starting with %r", len(cleaned), cleaned[0])
+        return len(cleaned)
+
+    def advance_prompt(self) -> str:
+        """Queue a one-step advance to the next prompt (clamped at the last).
+
+        Thread-safe — safe to call from a UI button while a generation is running.
+        The advance is applied at the next AR chunk boundary. Returns a status line
+        for the UI describing the current / queued state.
+        """
+        self.prompt_bank.request_advance()
+        return self.prompt_status()
+
+    def prompt_status(self) -> str:
+        """Human-readable playlist state for the UI (current index / total / queued)."""
+        total = self.prompt_bank.total
+        if total == 0:
+            return "Prompts: 0 loaded."
+        idx = self.prompt_bank.index
+        queued = self.prompt_bank.queued
+        text = self.prompt_bank.current_prompt()
+        head = f"▶ Prompt **{idx + 1}/{total}**"
+        if queued:
+            head += f"  (⏭ +{queued} queued → next: **{min(idx + queued, total - 1) + 1}/{total}**)"
+        return f"{head}: {text}"
 
     @property
     def active_prompt(self) -> str:
@@ -310,7 +425,7 @@ class InteractiveStreamingSession:
     def run(  # noqa: PLR0913, PLR0915
         self,
         *,
-        initial_prompt: str,
+        prompts: list[str],
         seed: int,
         height: int,
         width: int,
@@ -327,17 +442,19 @@ class InteractiveStreamingSession:
         tiling_config: TilingConfig | None = None,
         output_dir: str | None = None,
     ) -> Generator[StreamUpdate, None, None]:
-        """Generate with live prompt injection, yielding a growing clip + streaming audio.
+        """Generate over a pre-encoded prompt playlist, yielding a growing clip + audio.
 
         Yields one :class:`StreamUpdate` per AR chunk: a freshly re-encoded mp4 of
         the clip so far, the newly-added trailing audio samples, and a status line.
-        At each chunk boundary the live prompt slot is drained; if a new prompt
-        arrived it is re-encoded (cached otherwise) and applied to the next chunk's
-        cross-attention only.
+        All ``prompts`` are pre-encoded once at the start and cached in the
+        :class:`PromptBank`; generation runs on the first prompt. At each chunk
+        boundary the bank applies at most one queued advance (from the UI's **Next
+        Prompt** button) and returns the current prompt's cached cross-attention
+        context — so the model keeps running on the current prompt until the next
+        advance, and a switch affects only subsequent chunks.
         """
         if not self._started or self._transformer is None or self._live_encoder is None:
             raise RuntimeError("Session not started — call start() before run().")
-        live = self._live_encoder
         assert_resolution(height=height, width=width, is_two_stage=False)
         if not image_path:
             raise ValueError("A reference image (the sink) is required.")
@@ -354,9 +471,9 @@ class InteractiveStreamingSession:
             noiser = GaussianNoiser(generator=generator)
             dtype = self.dtype
 
-            # Encode the initial prompt (sets the active prompt + caches it).
-            self._active_prompt = initial_prompt.strip()
-            v_context, a_context = live.encode(initial_prompt, enhance=enhance_prompt)
+            # Pre-encode ALL prompts once and cache them in the bank (12B Gemma, so
+            # encode eagerly + once). Resets the active prompt to the first one.
+            self.prefetch_prompts(prompts, enhance=enhance_prompt)
 
             # Sink: encode the reference first-frame image to a video latent.
             sink_latent = self.image_conditioner(
@@ -389,18 +506,17 @@ class InteractiveStreamingSession:
 
             stepper = EulerDiffusionStep()
 
-            # Live-prompt context resolver: drain the slot at each chunk boundary.
-            # On change, re-encode (Gemma kept alive) and update the active prompt;
-            # otherwise reuse the cached context (no re-encode). The initial encode
-            # above guarantees ``live._last_context`` is set for the cached path.
+            # Playlist context resolver: apply at most one queued advance (from the
+            # UI's Next Prompt button) at each chunk boundary, then return the bank's
+            # current cached context. No advance pending → the current prompt's
+            # context is reused every chunk (keeps running on it). All contexts are
+            # pre-encoded, so this is a pure lookup — no Gemma call per chunk.
             def context_resolver(i: int, n: int) -> tuple[torch.Tensor, torch.Tensor]:
                 del i, n
-                pending = self.prompt_slot.drain()
-                if pending and pending != self._active_prompt:
-                    logger.info("Live prompt change: %r -> %r", self._active_prompt, pending)
-                    self._active_prompt = pending
-                    return live.encode(pending)
-                return live._last_context if live._last_context is not None else (v_context, a_context)
+                if self.prompt_bank.drain_one_advance():
+                    self._active_prompt = self.prompt_bank.current_prompt()
+                    logger.info("Prompt advance -> %r", self._active_prompt)
+                return self.prompt_bank.current_context()
 
             out_dir = output_dir or tempfile.mkdtemp(prefix="ltx2_stream_")
             prev_video_path: str | None = None

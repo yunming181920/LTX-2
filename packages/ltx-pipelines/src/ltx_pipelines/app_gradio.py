@@ -1,10 +1,13 @@
-"""Gradio UI for interactive streaming LTX-2 TI2V — live prompt + streaming A/V.
+"""Gradio UI for interactive streaming LTX-2 TI2V — pre-encoded prompt playlist + streaming A/V.
 
 Launches a long-lived :class:`InteractiveStreamingSession` (DiT + Gemma + VAEs built
-once, resident) and a Gradio Blocks app. While a clip streams, editing the **live
-prompt** textbox rewrites the cross-attention conditioning for subsequent AR chunks
-(text is not part of the cached self-attention history, so the change is clean) —
-the growing video visibly changes content on the next chunk, and audio plays live.
+once, resident) and a Gradio Blocks app. Enter **several prompts** (one per line);
+on **Generate** they are all pre-encoded once by Gemma and cached in memory, then the
+clip streams starting from the first prompt. The **Next Prompt** button advances to
+the next pre-encoded prompt — applied at the next AR chunk boundary as a pure
+cross-attention swap (text is not part of the cached self-attention history, so the
+switch is clean and does not reset the video). Audio plays live. Until Next is
+pressed the model keeps running on the current prompt; the last prompt clamps (no loop).
 
 Run (after `uv sync`, models downloaded as in the upstream README):
 
@@ -12,9 +15,9 @@ Run (after `uv sync`, models downloaded as in the upstream README):
         --checkpoint-path models/ltx-2.3/ltx-2.3-22b-dev.safetensors \
         --gemma-root models/gemma-3-12b
 
-Then open the printed URL, upload a reference image (the sink), set the initial
-prompt, hit **Generate**, and edit the live prompt mid-stream. On low-VRAM GPUs add
-`--quantization fp8-cast --offload cpu` (note: Gemma stays resident — 12B).
+Then open the printed URL, upload a reference image (the sink), enter one prompt per
+line, and hit **Generate**; press **Next Prompt** while it streams to switch prompts.
+On low-VRAM GPUs add `--quantization fp8-cast --offload cpu` (note: Gemma stays resident — 12B).
 
 This is a conceptual/interactive demo (the base model is bidirectionally trained,
 so the causal streaming regime is a train/test mismatch — see the README gaps).
@@ -40,7 +43,7 @@ def _build_ui(session: InteractiveStreamingSession) -> "Blocks":  # type: ignore
 
     def generate(  # noqa: PLR0913
         image_path: str,
-        initial_prompt: str,
+        prompts_text: str,
         height: int,
         width: int,
         num_frames: int,
@@ -52,14 +55,23 @@ def _build_ui(session: InteractiveStreamingSession) -> "Blocks":  # type: ignore
         causal_cross_attn: bool,
         enhance_prompt: bool,
     ):
-        """Generator: drive the session, yielding (video, audio, status) per chunk."""
+        """Generator: drive the session, yielding (video, audio, status, prompt_status) per chunk."""
         if not image_path:
-            yield None, None, "⚠️ Please provide a reference image (the sink)."
+            yield None, None, "⚠️ Please provide a reference image (the sink).", session.prompt_status()
             return
-        yield None, None, "⏳ Starting generation…"
+        prompts = [ln.strip() for ln in (prompts_text or "").splitlines() if ln.strip()]
+        if not prompts:
+            yield None, None, "⚠️ Enter at least one prompt (one per line).", session.prompt_status()
+            return
+        yield (
+            None,
+            None,
+            f"⏳ Pre-encoding {len(prompts)} prompt(s)…",
+            session.prompt_status(),
+        )
         try:
             for update in session.run(
-                initial_prompt=initial_prompt,
+                prompts=prompts,
                 seed=int(seed),
                 height=int(height),
                 width=int(width),
@@ -73,33 +85,34 @@ def _build_ui(session: InteractiveStreamingSession) -> "Blocks":  # type: ignore
                 causal_cross_attn=bool(causal_cross_attn),
                 tiling_config=TilingConfig.default(),
             ):
-                yield update.video_path, update.audio, update.status
+                yield update.video_path, update.audio, update.status, session.prompt_status()
         except Exception as exc:  # noqa: BLE001 — surface to the UI status line
             logger.exception("generation failed")
-            yield None, None, f"✗ error: {exc}"
+            yield None, None, f"✗ error: {exc}", session.prompt_status()
 
     with gr.Blocks(title="LTX-2 Interactive Streaming") as demo:
         gr.Markdown(
-            "## LTX-2 · Interactive Streaming Video (live prompt)\n"
-            "Upload a reference image (the sink), set the initial prompt, and **Generate**. "
-            "While it streams, edit the **live prompt** — the next chunk picks it up "
-            "(text is cross-attention, so the change does not reset the video)."
+            "## LTX-2 · Interactive Streaming Video (prompt playlist)\n"
+            "Upload a reference image (the sink), enter **one prompt per line**, and **Generate**. "
+            "All prompts are pre-encoded once on start; the clip streams from the first. Press "
+            "**Next Prompt** while streaming to switch — applied at the next chunk as a clean "
+            "cross-attention swap (no video reset). Until then it keeps running on the current "
+            "prompt; the last prompt clamps (no loop)."
         )
         with gr.Row():
             with gr.Column(scale=1):
                 image_in = gr.Image(type="filepath", label="Reference image (sink)")
-                initial_prompt = gr.Textbox(
-                    label="Initial prompt", value="A person talking calmly to the camera."
-                )
-                live_prompt = gr.Textbox(
-                    label="Live prompt (auto-applies on next chunk)",
-                    placeholder="Type a new prompt while generating…",
+                prompts_in = gr.Textbox(
+                    label="Prompts (one per line — pre-encoded, advance with 'Next')",
+                    value="A person talking calmly to the camera.\nA person laughing.\nA person looking surprised.",
+                    lines=8,
                 )
                 seed = gr.Slider(0, 2**31 - 1, value=0, step=1, label="Seed")
-                enhance = gr.Checkbox(value=False, label="Enhance initial prompt (Gemma)")
+                enhance = gr.Checkbox(value=False, label="Enhance prompts (Gemma)")
                 causal = gr.Checkbox(value=True, label="Causal cross-attention (AV)")
                 with gr.Row():
                     start_btn = gr.Button("▶ Generate", variant="primary")
+                    next_btn = gr.Button("⏭ Next Prompt", variant="secondary")
                     stop_btn = gr.Button("⏹ Stop", variant="stop")
             with gr.Column(scale=1):
                 with gr.Accordion("Generation settings", open=False):
@@ -110,24 +123,26 @@ def _build_ui(session: InteractiveStreamingSession) -> "Blocks":  # type: ignore
                     steps = gr.Slider(1, 80, value=30, step=1, label="Inference steps")
                     window_chunks = gr.Slider(1, 16, value=4, step=1, label="Window chunks")
                     chunk_frames = gr.Slider(1, 8, value=1, step=1, label="Chunk frames")
+                prompt_status_out = gr.Markdown("Prompts: 0 loaded.")
                 video_out = gr.Video(label="Growing video", autoplay=True)
                 audio_out = gr.Audio(label="Live audio", streaming=True, autoplay=True)
                 status_out = gr.Markdown("Idle.")
 
-        # Live prompt: each edit queues the latest value for the next chunk boundary.
-        live_prompt.change(
-            fn=lambda text: session.submit_prompt(text),
-            inputs=[live_prompt],
-            outputs=None,
+        # Next Prompt: queue a one-step advance (clamped at the last). Thread-safe,
+        # runs concurrently with the streaming generator; refreshes the status line.
+        next_btn.click(
+            fn=lambda: session.advance_prompt(),
+            inputs=None,
+            outputs=[prompt_status_out],
         )
 
         gen_event = start_btn.click(
             generate,
             inputs=[
-                image_in, initial_prompt, height, width, num_frames, frame_rate,
+                image_in, prompts_in, height, width, num_frames, frame_rate,
                 steps, window_chunks, chunk_frames, seed, causal, enhance,
             ],
-            outputs=[video_out, audio_out, status_out],
+            outputs=[video_out, audio_out, status_out, prompt_status_out],
             concurrency_limit=1,
         )
         stop_btn.click(fn=None, inputs=None, outputs=None, cancels=[gen_event])
