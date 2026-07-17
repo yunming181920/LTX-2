@@ -10,6 +10,24 @@
 
 ---
 
+## ✍️ Author's Notes / 作者见解
+
+**English.** Both **Vidu S1** and **Wan Streamer 0.3** implement this kind of
+interactive (streaming, memory-based) video generation. My guess is that
+**Wan Streamer 0.3**'s condition injection uses embeddings produced by a
+**Qwen3.5-Omni** multimodal model, whereas **Vidu S1** may condition on a
+multimodal model — or possibly on pure text. As for this project: it has been
+verified to actually run on **dual 4090 GPUs**, but the results are **not ideal** —
+a natively **full-attention** model cannot be directly repurposed for
+**memory-augmented causal attention**.
+
+**中文。** **Vidu S1** 和 **Wan Streamer 0.3** 都实现了这种交互式（带记忆的流式）视频生成。
+我猜测 **Wan Streamer 0.3** 的 condition 注入可能是用 **Qwen3.5-Omni** 多模态模型得到的 embedding，
+而 **Vidu S1** 使用的可能是多模态模型，也可能是纯文本。至于本项目：经 **双 4090** 实测确实能跑起来，
+但结果 **不太理想** —— 原生的 **全注意力** 模型无法直接套用 **带记忆的因果注意力**。
+
+---
+
 ## English
 
 ### What this is
