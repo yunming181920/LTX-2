@@ -62,16 +62,26 @@ class CausalStreamingModel(torch.nn.Module):
         *,
         cache_audio: bool = False,
         audio_tokens_per_frame: int = 1,
+        strategy: str = "twin",
+        num_steps: int = 0,
     ) -> None:
         super().__init__()
         self.x0 = x0_model
         self.tokens_per_frame = tokens_per_frame
         self.audio_tokens_per_frame = audio_tokens_per_frame
         self.cache_audio = cache_audio
+        self.strategy = strategy
+        self.num_steps = num_steps
         blocks = self.x0.velocity_model.transformer_blocks
         # Video caches: 1-frame sink + persistent first chunk (Vidu S1 §2.3.1).
         self._caches: list[StreamingKVCache] = [
-            StreamingKVCache(window_chunks, sink_tokens=tokens_per_frame, persistent_first=True)
+            StreamingKVCache(
+                window_chunks,
+                sink_tokens=tokens_per_frame,
+                persistent_first=True,
+                strategy=strategy,
+                num_steps=num_steps,
+            )
             for _ in blocks
         ]
         for blk, cache in zip(blocks, self._caches):
@@ -82,7 +92,13 @@ class CausalStreamingModel(torch.nn.Module):
         self._audio_caches: list[StreamingKVCache] = []
         if cache_audio:
             self._audio_caches = [
-                StreamingKVCache(window_chunks, sink_tokens=0, persistent_first=False)
+                StreamingKVCache(
+                    window_chunks,
+                    sink_tokens=0,
+                    persistent_first=False,
+                    strategy=strategy,
+                    num_steps=num_steps,
+                )
                 for _ in blocks
             ]
             for blk, cache in zip(blocks, self._audio_caches):
@@ -95,6 +111,7 @@ class CausalStreamingModel(torch.nn.Module):
         self._audio_query_mask = None
         self._audio_hist_len = 0
         self._mode: str = "clean"
+        self._step_idx: int = 0
 
     @property
     def num_blocks(self) -> int:
@@ -151,16 +168,22 @@ class CausalStreamingModel(torch.nn.Module):
         if audio_hist_len is not None:
             self._audio_hist_len = audio_hist_len
 
-    def set_mode(self, mode: str) -> None:
-        """Select the TwinCache snapshot history reads (``"noisy"``/``"clean"``)."""
-        self._mode = mode
+    def set_mode(self, mode: str, step_idx: int | None = None) -> None:
+        """Select the TwinCache snapshot history reads (``"noisy"``/``"clean"``).
 
-    def stash(self, mode: str) -> None:
+        For the ``noisy_steps`` strategy, ``step_idx`` selects which per-step
+        snapshot the ring reads (the current denoising step).
+        """
+        self._mode = mode
+        if step_idx is not None:
+            self._step_idx = step_idx
+
+    def stash(self, mode: str, step_idx: int | None = None) -> None:
         """Snapshot every cache's current-chunk K/V into its pending entry."""
         for cache in self._caches:
-            cache.stash(mode)
+            cache.stash(mode, step_idx=step_idx)
         for cache in self._audio_caches:
-            cache.stash(mode)
+            cache.stash(mode, step_idx=step_idx)
 
     def commit(self) -> None:
         """Append every cache's pending TwinCache entry to its FIFO ring."""
@@ -185,6 +208,7 @@ class CausalStreamingModel(torch.nn.Module):
                 query_mask=self._video_query_mask,
                 hist_len=self._video_hist_len,
                 tokens_per_frame=self.tokens_per_frame,
+                step_idx=self._step_idx,
             )
         for cache in self._audio_caches:
             cache.set_active(
@@ -193,6 +217,7 @@ class CausalStreamingModel(torch.nn.Module):
                 query_mask=self._audio_query_mask,
                 hist_len=self._audio_hist_len,
                 tokens_per_frame=self.audio_tokens_per_frame,
+                step_idx=self._step_idx,
             )
         try:
             return self.x0(video=video, audio=audio, perturbations=perturbations)

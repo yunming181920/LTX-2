@@ -1,20 +1,29 @@
-"""Tiny-model M1 vs M2 validation on CPU (random weights, no checkpoint).
+"""Tiny-model streaming-strategy validation on CPU (random weights, no checkpoint).
 
 Complements ``test_streaming_joint_parity.py`` (which needs the full GPU
 checkpoint): a 2-layer randomly initialized ``LTXModel`` is enough to check the
-*plumbing* of both streaming paths end to end.
+*plumbing* of every streaming strategy end to end.
 
-Phase 1: single-chunk strict parity — with no history the M2 cached path
-(RoPE repositioning + query-mask + full-window noise accounting + clean-KV
-refresh) must reproduce M1's standard attention numerically, for BOTH
-modalities, with causal cross-attention off AND on.
+Strategies (see ``--stream-strategy`` in ``ti2vid_streaming.py``):
+  * ``full_recompute`` (M1): latent TwinCache, full per-step history recompute.
+  * ``kv_twin`` (M2): KV cache, history reads noisy at mid steps + clean at the
+    final step (Vidu S1 §2.3.1).
+  * ``kv_clean`` (ablation A): KV cache, history reads clean at every step.
+  * ``kv_noisy_steps`` (ablation B): KV cache, step t reads the history's own
+    step-t noisy snapshot (noise-level matched; no clean, no sigma-0 forward).
+  * ``image_cond`` (ablation C): no KV cache; each chunk conditions on the
+    previous chunk's last frame as the image reference (rotating sink).
+
+Phase 1: single-chunk strict parity — with NO history every cached path
+(``kv_twin``/``kv_clean``/``kv_noisy_steps``) has an empty cache (``read()``
+returns ``None``), so all three are numerically identical to M1 (``full_recompute``)
+and to ``image_cond`` (whose chunk-0 sink is the same user image, no history).
+All five strategies must agree bit-close for BOTH modalities, cross-attn off/on.
 
 Phase 2: multi-chunk smoke deep into eviction (8 chunks, window 2) with the
-time-causal cross-attn ON — exercises the audio window clock alignment
-(``_audio_window_alignment``), the empty-cross-row fallback, the persistent
-first video chunk, FIFO eviction and the M2 per-chunk clean-KV refresh; checks
-both paths produce finite latents. (With history the paths are NOT numerically
-equal by design — M2 reuses cached K/V.)
+time-causal cross-attn ON — exercises every strategy's per-chunk finalize /
+cache-commit / sink-rotation; checks all produce finite latents of the right
+shape. (With history the strategies are NOT numerically equal by design.)
 
 Run:
 
@@ -29,12 +38,25 @@ from ltx_core.components.patchifiers import AudioPatchifier, VideoLatentPatchifi
 from ltx_core.model.transformer.model import LTXModel, X0Model
 from ltx_core.tools import AudioLatentTools, VideoLatentTools
 from ltx_core.types import AudioLatentShape, VideoLatentShape
-from ltx_pipelines.utils.streaming import streaming_generate_joint, streaming_generate_joint_cached
+from ltx_pipelines.utils.streaming import (
+    streaming_generate_joint,
+    streaming_generate_joint_cached,
+    streaming_generate_joint_image_cond,
+)
 
 FPS = 25.0
 H, W = 2, 3
 CH = 8
 ACH, MEL = 4, 16  # audio token dim = 64
+
+# Map CLI strategy name -> (driver, cache-strategy-or-None)
+_STRATEGIES = {
+    "full_recompute": (streaming_generate_joint, None),
+    "kv_twin": (streaming_generate_joint_cached, "twin"),
+    "kv_clean": (streaming_generate_joint_cached, "clean"),
+    "kv_noisy_steps": (streaming_generate_joint_cached, "noisy_steps"),
+    "image_cond": (streaming_generate_joint_image_cond, None),
+}
 
 
 def build_tiny() -> X0Model:
@@ -61,7 +83,7 @@ def build_tiny() -> X0Model:
     return X0Model(model).float().eval()
 
 
-def run(x0: X0Model, num_latent_frames: int, *, use_kv_cache: bool, causal_cross_attn: bool, seed: int = 0):
+def run(x0: X0Model, num_latent_frames: int, *, strategy: str, causal_cross_attn: bool, seed: int = 0):
     device = torch.device("cpu")
     v_shape = VideoLatentShape(1, CH, num_latent_frames, H, W)
     total_audio = int(round((num_latent_frames - 1) * 8 / FPS * 25)) + 1
@@ -73,7 +95,6 @@ def run(x0: X0Model, num_latent_frames: int, *, use_kv_cache: bool, causal_cross
         sigmas=torch.linspace(1.0, 0.0, 5),
         num_generated_latent_frames=num_latent_frames - 1,
         chunk_frames=1,
-        window_chunks=2,
         video_tools_full=video_tools,
         audio_tools_full=audio_tools,
         sink_latent_unpatchified=torch.randn(1, CH, 1, H, W),
@@ -87,28 +108,35 @@ def run(x0: X0Model, num_latent_frames: int, *, use_kv_cache: bool, causal_cross
         causal_cross_attn=causal_cross_attn,
         cross_attn_lookahead_sec=0.0,
     )
-    fn = streaming_generate_joint_cached if use_kv_cache else streaming_generate_joint
-    return fn(**kwargs)
+    fn, cache_strategy = _STRATEGIES[strategy]
+    if cache_strategy is not None:
+        return fn(**kwargs, window_chunks=2, strategy=cache_strategy)
+    if fn is streaming_generate_joint:
+        return fn(**kwargs, window_chunks=2)
+    return fn(**kwargs)  # image_cond: no window_chunks
 
 
 def main() -> None:
     x0 = build_tiny()
     with torch.inference_mode():
         # Phase 1: single chunk (2 latent frames -> 1 generated), no history.
+        # Every strategy must agree bit-close (no history => identical paths).
         for ccx in (False, True):
-            m1 = run(x0, 2, use_kv_cache=False, causal_cross_attn=ccx)
-            m2 = run(x0, 2, use_kv_cache=True, causal_cross_attn=ccx)
-            dv = (m1[0] - m2[0]).abs().max().item()
-            da = (m1[1] - m2[1]).abs().max().item()
-            print(f"[phase1 ccx={ccx}] single-chunk parity: video max|diff|={dv:.3e} audio max|diff|={da:.3e}")
-            assert dv < 1e-4 and da < 1e-4, f"single-chunk M2 must match M1 (ccx={ccx})"
+            outs = {s: run(x0, 2, strategy=s, causal_cross_attn=ccx) for s in _STRATEGIES}
+            ref_v, ref_a = outs["full_recompute"]
+            for s, (v, a) in outs.items():
+                dv = (ref_v - v).abs().max().item()
+                da = (ref_a - a).abs().max().item()
+                print(f"[phase1 ccx={ccx}] {s:15s} vs full_recompute: "
+                      f"video max|diff|={dv:.3e} audio max|diff|={da:.3e}")
+                assert dv < 1e-4 and da < 1e-4, f"single-chunk {s} must match full_recompute (ccx={ccx})"
 
         # Phase 2: 8 generated chunks, window 2 -> deep eviction; causal cross ON.
-        for kv in (False, True):
-            v, a = run(x0, 9, use_kv_cache=kv, causal_cross_attn=True)
-            assert torch.isfinite(v).all() and torch.isfinite(a).all(), f"non-finite latents (kv={kv})"
-            print(f"[phase2] multi-chunk kv={kv}: video {tuple(v.shape)} audio {tuple(a.shape)} finite OK")
-    print("\nTINY M1/M2 VALIDATION PASSED")
+        for s in _STRATEGIES:
+            v, a = run(x0, 9, strategy=s, causal_cross_attn=True)
+            assert torch.isfinite(v).all() and torch.isfinite(a).all(), f"non-finite latents ({s})"
+            print(f"[phase2] {s:15s} multi-chunk: video {tuple(v.shape)} audio {tuple(a.shape)} finite OK")
+    print("\nTINY STREAMING-STRATEGY VALIDATION PASSED")
 
 
 if __name__ == "__main__":

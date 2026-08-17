@@ -54,11 +54,12 @@ from ltx_core.loader import LoraPathStrengthAndSDOps
 from ltx_core.loader.registry import Registry
 from ltx_core.model.audio_vae import decode_audio
 from ltx_core.model.transformer.compiling import CompilationConfig
-from ltx_core.model.video_vae.tiling import TilingConfig
+from ltx_core.model.video_vae import TilingConfig
+from ltx_core.model.video_vae.transformer import DiffVAEMode
 from ltx_core.quantization import QuantizationPolicy
 from ltx_core.tools import AudioLatentTools, VideoLatentTools
 from ltx_core.types import Audio, AudioLatentShape, VideoLatentShape, VideoPixelShape
-from ltx_pipelines.utils.allocator_trim_strategy import AllocatorTrimStrategy
+from ltx_core.allocator_trim_strategy import AllocatorTrimStrategy
 from ltx_pipelines.utils.blocks import (
     AudioDecoder,
     DiffusionStage,
@@ -66,9 +67,21 @@ from ltx_pipelines.utils.blocks import (
     PromptEncoder,
     VideoDecoder,
 )
-from ltx_pipelines.utils.helpers import assert_resolution, cleanup_memory, generate_enhanced_prompt, get_device
+from ltx_pipelines.utils.helpers import (
+    assert_resolution,
+    cleanup_memory,
+    generate_enhanced_prompt,
+    get_device,
+    tiling_scale_factors_for_vae,
+)
 from ltx_pipelines.utils.media_io import encode_video, load_image_and_preprocess
-from ltx_pipelines.utils.streaming_interactive import StreamChunk, iter_streaming_chunks_joint
+from ltx_pipelines.utils.model_paths import ModelPaths
+from ltx_pipelines.utils.streaming_interactive import (
+    StreamChunk,
+    iter_streaming_chunks_joint,
+    iter_streaming_chunks_joint_cached,
+    iter_streaming_chunks_joint_image_cond,
+)
 from ltx_pipelines.utils.types import OffloadMode
 
 logger = logging.getLogger(__name__)
@@ -209,8 +222,7 @@ class InteractiveStreamingSession:
 
     def __init__(
         self,
-        checkpoint_path: str,
-        gemma_root: str,
+        model_paths: ModelPaths,
         loras: list[LoraPathStrengthAndSDOps],
         device: torch.device | None = None,
         text_encoder_device: torch.device | None = None,
@@ -219,6 +231,7 @@ class InteractiveStreamingSession:
         compilation_config: CompilationConfig | None = None,
         offload_mode: OffloadMode = OffloadMode.NONE,
         alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
+        diffvae_optimization: DiffVAEMode = DiffVAEMode.CHUNKED_EAGER,
     ) -> None:
         self.dtype = torch.bfloat16
         self.device = device or get_device()
@@ -226,9 +239,10 @@ class InteractiveStreamingSession:
         # Encoded context tensors are moved to ``self.device`` before feeding the DiT.
         self.text_encoder_device = text_encoder_device or self.device
         self._scheduler = LTX2Scheduler()
+        self.diffvae_optimization = diffvae_optimization
+        self.video_scale_factors = tiling_scale_factors_for_vae(model_paths.video_vae())
         self.prompt_encoder = PromptEncoder(
-            checkpoint_path=checkpoint_path,
-            gemma_root=gemma_root,
+            model_paths,
             dtype=self.dtype,
             device=self.text_encoder_device,
             registry=registry,
@@ -236,14 +250,14 @@ class InteractiveStreamingSession:
             alloc_trim_strategy=alloc_trim_strategy,
         )
         self.image_conditioner = ImageConditioner(
-            checkpoint_path=checkpoint_path,
+            checkpoint_path=model_paths.video_vae(),
             dtype=self.dtype,
             device=self.device,
             registry=registry,
             alloc_trim_strategy=alloc_trim_strategy,
         )
         self.stage = DiffusionStage.from_checkpoint(
-            checkpoint_path=checkpoint_path,
+            checkpoint_path=model_paths.transformer(),
             dtype=self.dtype,
             device=self.device,
             loras=tuple(loras),
@@ -252,16 +266,18 @@ class InteractiveStreamingSession:
             compilation_config=compilation_config,
             offload_mode=offload_mode,
             alloc_trim_strategy=alloc_trim_strategy,
+            scale_factors=self.video_scale_factors,
         )
         self.video_decoder = VideoDecoder(
-            checkpoint_path=checkpoint_path,
+            checkpoint_path=model_paths.video_vae(),
             dtype=self.dtype,
             device=self.device,
             registry=registry,
             alloc_trim_strategy=alloc_trim_strategy,
+            diffvae_optimization=diffvae_optimization,
         )
         self.audio_decoder = AudioDecoder(
-            checkpoint_path=checkpoint_path,
+            checkpoint_path=model_paths.audio_vae(),
             dtype=self.dtype,
             device=self.device,
             registry=registry,
@@ -291,8 +307,10 @@ class InteractiveStreamingSession:
         if self._started:
             return
         logger.info("Building streaming session models (DiT + Gemma + VAEs)...")
-        # DiT: hold the model_context() open for the whole session.
-        self._transformer_ctx = self.stage.model_context()
+        # DiT: hold the transformer context open for the whole session.
+        # NOTE: 2.5 made DiffusionStage's transformer context private; the streaming
+        # session holds the DiT resident via this ctx (no public equivalent).
+        self._transformer_ctx = self.stage._transformer_ctx()
         self._transformer = self._transformer_ctx.__enter__()
         self._live_encoder = LivePromptEncoder(
             self.prompt_encoder,
@@ -362,6 +380,7 @@ class InteractiveStreamingSession:
         cross_attn_lookahead_sec: float = 0.0,
         tiling_config: TilingConfig | None = None,
         output_dir: str | None = None,
+        stream_strategy: str = "full_recompute",
     ) -> Generator[StreamUpdate, None, None]:
         """Generate with live prompt injection, yielding a growing clip + streaming audio.
 
@@ -415,9 +434,11 @@ class InteractiveStreamingSession:
             pixel_shape = VideoPixelShape(
                 batch=1, frames=num_frames, height=height, width=width, fps=frame_rate
             )
-            v_shape = VideoLatentShape.from_pixel_shape(pixel_shape)
+            v_shape = VideoLatentShape.from_pixel_shape(pixel_shape, scale_factors=self.video_scale_factors)
             a_shape = AudioLatentShape.from_video_pixel_shape(pixel_shape)
-            video_tools_full = VideoLatentTools(VideoLatentPatchifier(patch_size=1), v_shape, frame_rate)
+            video_tools_full = VideoLatentTools(
+                VideoLatentPatchifier(patch_size=1), v_shape, frame_rate, scale_factors=self.video_scale_factors
+            )
             audio_tools_full = AudioLatentTools(AudioPatchifier(patch_size=1), a_shape)
             num_generated_latent_frames = v_shape.frames - 1  # frame 0 is the sink
             if num_generated_latent_frames <= 0:
@@ -442,23 +463,63 @@ class InteractiveStreamingSession:
             prev_video_path: str | None = None
             prev_audio_len = 0
 
-            for chunk in iter_streaming_chunks_joint(
-                sigmas=sigmas,
-                num_generated_latent_frames=num_generated_latent_frames,
-                chunk_frames=chunk_frames,
-                window_chunks=window_chunks,
-                video_tools_full=video_tools_full,
-                audio_tools_full=audio_tools_full,
-                sink_latent_unpatchified=sink_latent,
-                context_resolver=context_resolver,
-                stepper=stepper,
-                transformer=self._transformer,
-                noiser=noiser,
-                dtype=dtype,
-                device=self.device,
-                causal_cross_attn=causal_cross_attn,
-                cross_attn_lookahead_sec=cross_attn_lookahead_sec,
-            ):
+            _KV_STRATEGY = {"kv_twin": "twin", "kv_clean": "clean", "kv_noisy_steps": "noisy_steps"}
+            if stream_strategy in _KV_STRATEGY:
+                chunk_iter = iter_streaming_chunks_joint_cached(
+                    sigmas=sigmas,
+                    num_generated_latent_frames=num_generated_latent_frames,
+                    chunk_frames=chunk_frames,
+                    window_chunks=window_chunks,
+                    video_tools_full=video_tools_full,
+                    audio_tools_full=audio_tools_full,
+                    sink_latent_unpatchified=sink_latent,
+                    context_resolver=context_resolver,
+                    stepper=stepper,
+                    transformer=self._transformer,
+                    noiser=noiser,
+                    dtype=dtype,
+                    device=self.device,
+                    causal_cross_attn=causal_cross_attn,
+                    cross_attn_lookahead_sec=cross_attn_lookahead_sec,
+                    strategy=_KV_STRATEGY[stream_strategy],
+                )
+            elif stream_strategy == "image_cond":
+                chunk_iter = iter_streaming_chunks_joint_image_cond(
+                    sigmas=sigmas,
+                    num_generated_latent_frames=num_generated_latent_frames,
+                    chunk_frames=chunk_frames,
+                    video_tools_full=video_tools_full,
+                    audio_tools_full=audio_tools_full,
+                    sink_latent_unpatchified=sink_latent,
+                    context_resolver=context_resolver,
+                    stepper=stepper,
+                    transformer=self._transformer,
+                    noiser=noiser,
+                    dtype=dtype,
+                    device=self.device,
+                    causal_cross_attn=causal_cross_attn,
+                    cross_attn_lookahead_sec=cross_attn_lookahead_sec,
+                )
+            else:  # full_recompute (M1)
+                chunk_iter = iter_streaming_chunks_joint(
+                    sigmas=sigmas,
+                    num_generated_latent_frames=num_generated_latent_frames,
+                    chunk_frames=chunk_frames,
+                    window_chunks=window_chunks,
+                    video_tools_full=video_tools_full,
+                    audio_tools_full=audio_tools_full,
+                    sink_latent_unpatchified=sink_latent,
+                    context_resolver=context_resolver,
+                    stepper=stepper,
+                    transformer=self._transformer,
+                    noiser=noiser,
+                    dtype=dtype,
+                    device=self.device,
+                    causal_cross_attn=causal_cross_attn,
+                    cross_attn_lookahead_sec=cross_attn_lookahead_sec,
+                )
+
+            for chunk in chunk_iter:
                 update, prev_audio_len = self._emit_chunk(
                     chunk=chunk,
                     frame_rate=frame_rate,

@@ -27,8 +27,8 @@ Two paths:
     sink-less layout) — run ``tests/test_streaming_joint_parity.py`` in a GPU
     env before trusting.
 
-No core (ltx-core) production changes; reuses ``DiffusionStage.model_context``
-for the transformer lifecycle, ``PromptEncoder``/``ImageConditioner`` for IO,
+No core (ltx-core) production changes; reuses ``DiffusionStage``'s transformer
+context for the transformer lifecycle, ``PromptEncoder``/``ImageConditioner`` for IO,
 ``VideoDecoder``/``AudioDecoder`` for output, and the streaming primitives in
 :mod:`ltx_pipelines.utils.streaming`.
 """
@@ -46,11 +46,12 @@ from ltx_core.components.schedulers import LTX2Scheduler
 from ltx_core.loader import LoraPathStrengthAndSDOps
 from ltx_core.loader.registry import Registry
 from ltx_core.model.transformer.compiling import CompilationConfig
-from ltx_core.model.video_vae.tiling import TilingConfig
+from ltx_core.model.video_vae import TileSizeConfig, TilingConfig
+from ltx_core.model.video_vae.transformer import DiffVAEMode
 from ltx_core.quantization import QuantizationPolicy
 from ltx_core.tools import AudioLatentTools, VideoLatentTools
 from ltx_core.types import Audio, AudioLatentShape, VideoLatentShape, VideoPixelShape
-from ltx_pipelines.utils.allocator_trim_strategy import AllocatorTrimStrategy
+from ltx_core.allocator_trim_strategy import AllocatorTrimStrategy
 from ltx_pipelines.utils.args import (
     ImageConditioningInput,
     default_1_stage_arg_parser,
@@ -63,7 +64,13 @@ from ltx_pipelines.utils.blocks import (
     PromptEncoder,
     VideoDecoder,
 )
-from ltx_pipelines.utils.helpers import assert_resolution, get_device
+from ltx_pipelines.utils.helpers import (
+    assert_resolution,
+    ensure_tiling_config,
+    get_device,
+    tiling_scale_factors_for_vae,
+)
+from ltx_pipelines.utils.model_paths import ModelPaths
 from ltx_pipelines.utils.media_io import encode_video, load_image_and_preprocess
 from ltx_pipelines.utils.streaming import streaming_generate_joint
 from ltx_pipelines.utils.types import OffloadMode
@@ -82,8 +89,7 @@ class TI2VidStreamingPipeline:
 
     def __init__(
         self,
-        checkpoint_path: str,
-        gemma_root: str,
+        model_paths: ModelPaths,
         loras: list[LoraPathStrengthAndSDOps],
         device: torch.device | None = None,
         quantization: QuantizationPolicy | None = None,
@@ -91,13 +97,18 @@ class TI2VidStreamingPipeline:
         compilation_config: CompilationConfig | None = None,
         offload_mode: OffloadMode = OffloadMode.NONE,
         alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
+        diffvae_optimization: DiffVAEMode = DiffVAEMode.CHUNKED_EAGER,
     ):
         self.dtype = torch.bfloat16
         self.device = device or get_device()
         self._scheduler = LTX2Scheduler()
+        self.diffvae_optimization = diffvae_optimization
+        # Scale factors derived from the video VAE checkpoint (conv VAE -> the
+        # 32x32x8 default; DiffVAE -> its pixel_scale). Used for VideoLatentShape
+        # and tiling resolution, matching the 2.5 pipeline contract.
+        self.video_scale_factors = tiling_scale_factors_for_vae(model_paths.video_vae())
         self.prompt_encoder = PromptEncoder(
-            checkpoint_path=checkpoint_path,
-            gemma_root=gemma_root,
+            model_paths,
             dtype=self.dtype,
             device=self.device,
             registry=registry,
@@ -105,14 +116,14 @@ class TI2VidStreamingPipeline:
             alloc_trim_strategy=alloc_trim_strategy,
         )
         self.image_conditioner = ImageConditioner(
-            checkpoint_path=checkpoint_path,
+            checkpoint_path=model_paths.video_vae(),
             dtype=self.dtype,
             device=self.device,
             registry=registry,
             alloc_trim_strategy=alloc_trim_strategy,
         )
         self.stage = DiffusionStage.from_checkpoint(
-            checkpoint_path=checkpoint_path,
+            checkpoint_path=model_paths.transformer(),
             dtype=self.dtype,
             device=self.device,
             loras=tuple(loras),
@@ -121,16 +132,18 @@ class TI2VidStreamingPipeline:
             compilation_config=compilation_config,
             offload_mode=offload_mode,
             alloc_trim_strategy=alloc_trim_strategy,
+            scale_factors=self.video_scale_factors,
         )
         self.video_decoder = VideoDecoder(
-            checkpoint_path=checkpoint_path,
+            checkpoint_path=model_paths.video_vae(),
             dtype=self.dtype,
             device=self.device,
             registry=registry,
             alloc_trim_strategy=alloc_trim_strategy,
+            diffvae_optimization=diffvae_optimization,
         )
         self.audio_decoder = AudioDecoder(
-            checkpoint_path=checkpoint_path,
+            checkpoint_path=model_paths.audio_vae(),
             dtype=self.dtype,
             device=self.device,
             registry=registry,
@@ -151,6 +164,7 @@ class TI2VidStreamingPipeline:
         window_chunks: int = 4,
         chunk_frames: int = 1,
         use_kv_cache: bool = False,
+        stream_strategy: str = "full_recompute",
         causal_cross_attn: bool = True,
         cross_attn_lookahead_sec: float = 0.0,
         tiling_config: TilingConfig | None = None,
@@ -204,19 +218,35 @@ class TI2VidStreamingPipeline:
         )
 
         pixel_shape = VideoPixelShape(batch=1, frames=num_frames, height=height, width=width, fps=frame_rate)
-        v_shape = VideoLatentShape.from_pixel_shape(pixel_shape)
+        v_shape = VideoLatentShape.from_pixel_shape(pixel_shape, scale_factors=self.video_scale_factors)
         a_shape = AudioLatentShape.from_video_pixel_shape(pixel_shape)
-        video_tools_full = VideoLatentTools(VideoLatentPatchifier(patch_size=1), v_shape, frame_rate)
+        video_tools_full = VideoLatentTools(
+            VideoLatentPatchifier(patch_size=1), v_shape, frame_rate, scale_factors=self.video_scale_factors
+        )
         audio_tools_full = AudioLatentTools(AudioPatchifier(patch_size=1), a_shape)
         num_generated_latent_frames = v_shape.frames - 1  # frame 0 is the sink
         if num_generated_latent_frames <= 0:
             raise ValueError(f"num_frames={num_frames} yields no frames to generate beyond the sink.")
 
+        # Resolve tiling (AUTO_TILING/default -> concrete per-VAE/per-resolution config)
+        # before decode, the 2.5 pipeline contract.
+        resolved_tiling = ensure_tiling_config(
+            tiling_config,
+            scale_factors=self.video_scale_factors,
+            video_shape=pixel_shape,
+            vae_checkpoint_path=self.video_decoder.checkpoint_path,
+            diffvae_optimization=self.diffvae_optimization,
+            device=self.device,
+        )
+
         # Generation runs under the transformer's model context (DiT required);
         # decode uses separate decoders and runs outside it.
         stepper = EulerDiffusionStep()
-        with self.stage.model_context() as transformer:
-            if use_kv_cache:
+        # NOTE: 2.5 made DiffusionStage's transformer context private; the streaming
+        # driver holds the DiT open across chunks via this ctx (no public equivalent).
+        with self.stage._transformer_ctx() as transformer:
+            _KV_STRATEGY = {"kv_twin": "twin", "kv_clean": "clean", "kv_noisy_steps": "noisy_steps"}
+            if stream_strategy in _KV_STRATEGY:
                 from ltx_pipelines.utils.streaming import streaming_generate_joint_cached
 
                 full_video_latent, full_audio_latent = streaming_generate_joint_cached(
@@ -236,8 +266,29 @@ class TI2VidStreamingPipeline:
                     device=self.device,
                     causal_cross_attn=causal_cross_attn,
                     cross_attn_lookahead_sec=cross_attn_lookahead_sec,
+                    strategy=_KV_STRATEGY[stream_strategy],
                 )
-            else:
+            elif stream_strategy == "image_cond":
+                from ltx_pipelines.utils.streaming import streaming_generate_joint_image_cond
+
+                full_video_latent, full_audio_latent = streaming_generate_joint_image_cond(
+                    sigmas=sigmas,
+                    num_generated_latent_frames=num_generated_latent_frames,
+                    chunk_frames=chunk_frames,
+                    video_tools_full=video_tools_full,
+                    audio_tools_full=audio_tools_full,
+                    sink_latent_unpatchified=sink_latent,
+                    v_context=v_context_p,
+                    a_context=a_context_p,
+                    stepper=stepper,
+                    transformer=transformer,
+                    noiser=noiser,
+                    dtype=dtype,
+                    device=self.device,
+                    causal_cross_attn=causal_cross_attn,
+                    cross_attn_lookahead_sec=cross_attn_lookahead_sec,
+                )
+            else:  # full_recompute (M1)
                 full_video_latent, full_audio_latent = streaming_generate_joint(
                     sigmas=sigmas,
                     num_generated_latent_frames=num_generated_latent_frames,
@@ -257,7 +308,7 @@ class TI2VidStreamingPipeline:
                     cross_attn_lookahead_sec=cross_attn_lookahead_sec,
                 )
 
-        decoded_video = self.video_decoder(full_video_latent, tiling_config, generator=generator)
+        decoded_video = self.video_decoder(full_video_latent, resolved_tiling, generator=generator)
         decoded_audio = self.audio_decoder(full_audio_latent)
         return decoded_video, decoded_audio
 
@@ -286,12 +337,22 @@ def main() -> None:
     parser.add_argument(
         "--use-kv-cache",
         action="store_true",
-        help="M2: use the KV-cache + RoPE-repositioning path for BOTH video and audio "
-        "self-attention (faster; noisy history K/V are reused from each chunk's own "
-        "denoising pass and clean K/V from one extra sigma-0 forward per chunk, per "
-        "Vidu S1 §2.3.1, so results differ slightly from the default full-recompute "
-        "path — run the joint parity/smoke test before trusting). Default off (M1 "
-        "latent-level TwinCache).",
+        help="Legacy alias for --stream-strategy kv_twin (the current M2 TwinCache path). "
+        "Ignored if --stream-strategy is given explicitly.",
+    )
+    parser.add_argument(
+        "--stream-strategy",
+        choices=["full_recompute", "kv_twin", "kv_clean", "kv_noisy_steps", "image_cond"],
+        default=None,
+        help="Streaming context strategy (ablation). full_recompute (default) = M1 latent "
+        "TwinCache, full per-step history recompute. kv_twin = M2 KV cache, history reads "
+        "noisy at mid steps + clean at the final step (Vidu S1 §2.3.1). kv_clean (ablation A) "
+        "= M2 KV cache reading clean history at every step. kv_noisy_steps (ablation B) = M2 "
+        "KV cache reading, at step t, the history's own step-t noisy snapshot (noise-level "
+        "matched; no clean, no sigma-0 forward; ~num_steps/2x the KV memory of kv_twin — "
+        "reduce --num-inference-steps / --window-chunks or add --offload). image_cond "
+        "(ablation C) = no KV cache; each chunk conditions on the previous chunk's last "
+        "frame as the image reference (rotating sink), no attention history.",
     )
     parser.add_argument(
         "--causal-cross-attn",
@@ -312,15 +373,24 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # Resolve the streaming strategy. --stream-strategy (explicit) wins; otherwise
+    # --use-kv-cache maps to kv_twin; otherwise the M1 full-recompute default.
+    if args.stream_strategy is not None:
+        stream_strategy = args.stream_strategy
+    elif args.use_kv_cache:
+        stream_strategy = "kv_twin"
+    else:
+        stream_strategy = "full_recompute"
+
     pipeline = TI2VidStreamingPipeline(
-        checkpoint_path=args.checkpoint_path,
-        gemma_root=args.gemma_root,
+        model_paths=args.model_paths,
         loras=tuple(args.lora) if args.lora else (),
         quantization=args.quantization,
         compilation_config=args.compile,
         offload_mode=args.offload_mode,
+        diffvae_optimization=args.diffvae_optimization,
     )
-    tiling_config = TilingConfig.default()
+    tiling_config = TileSizeConfig.default()
 
     video, audio = pipeline(
         prompt=args.prompt,
@@ -335,6 +405,7 @@ def main() -> None:
         window_chunks=args.window_chunks,
         chunk_frames=args.chunk_frames,
         use_kv_cache=args.use_kv_cache,
+        stream_strategy=stream_strategy,
         causal_cross_attn=args.causal_cross_attn,
         cross_attn_lookahead_sec=args.cross_attn_lookahead_seconds,
         tiling_config=tiling_config,

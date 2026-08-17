@@ -31,7 +31,12 @@ from ltx_core.model.transformer.model import LTXModel, X0Model
 from ltx_core.tools import AudioLatentTools, VideoLatentTools
 from ltx_core.types import AudioLatentShape, VideoLatentShape
 from ltx_pipelines.utils.streaming import streaming_generate_joint
-from ltx_pipelines.utils.streaming_interactive import StreamChunk, iter_streaming_chunks_joint
+from ltx_pipelines.utils.streaming_interactive import (
+    StreamChunk,
+    iter_streaming_chunks_joint,
+    iter_streaming_chunks_joint_cached,
+    iter_streaming_chunks_joint_image_cond,
+)
 
 FPS = 25.0
 H, W = 2, 3
@@ -106,6 +111,28 @@ def run_interactive(x0: X0Model, num_latent_frames: int, resolver) -> list[Strea
     return list(iter_streaming_chunks_joint(**kw))
 
 
+# CLI strategy name -> (generator, cache-strategy-or-None)
+_INTERACTIVE_STRATEGIES = {
+    "full_recompute": (iter_streaming_chunks_joint, None),
+    "kv_twin": (iter_streaming_chunks_joint_cached, "twin"),
+    "kv_clean": (iter_streaming_chunks_joint_cached, "clean"),
+    "kv_noisy_steps": (iter_streaming_chunks_joint_cached, "noisy_steps"),
+    "image_cond": (iter_streaming_chunks_joint_image_cond, None),
+}
+
+
+def run_strategy(x0: X0Model, num_latent_frames: int, resolver, strategy: str) -> list[StreamChunk]:
+    kw = _base_kwargs(x0, num_latent_frames)
+    kw["context_resolver"] = resolver
+    fn, cache_strategy = _INTERACTIVE_STRATEGIES[strategy]
+    if cache_strategy is not None:
+        return list(fn(**kw, strategy=cache_strategy))
+    if fn is iter_streaming_chunks_joint:
+        return list(fn(**kw))  # window_chunks present
+    kw.pop("window_chunks", None)  # image_cond has no window_chunks
+    return list(fn(**kw))
+
+
 def main() -> None:
     x0 = build_tiny()
     with torch.inference_mode():
@@ -158,6 +185,47 @@ def main() -> None:
             f"resolver must be called once per chunk: got {calls['n']}, expected {expected}"
         )
         print(f"[phase3] resolver called {calls['n']} times for {expected} chunks")
+
+        # Phase A: single-chunk parity across all 5 strategies (no history =>
+        # every cached path's cache.read() returns None; image_cond chunk-0
+        # sink == M1 chunk-0 sink). All must agree bit-close with full_recompute.
+        for ccx in (False, True):
+            ctx_v = torch.randn(1, 4, 16)
+            ctx_a = torch.randn(1, 4, 16)
+            ref = run_strategy(x0, 2, lambda i, n: (ctx_v, ctx_a), "full_recompute")[-1]
+            for s in _INTERACTIVE_STRATEGIES:
+                if s == "full_recompute":
+                    continue
+                # rebuild base kwargs with this ccx
+                kw = _base_kwargs(x0, 2)
+                kw["causal_cross_attn"] = ccx
+                kw["context_resolver"] = lambda i, n: (ctx_v, ctx_a)
+                fn, cs = _INTERACTIVE_STRATEGIES[s]
+                if cs is not None:
+                    chunks = list(fn(**kw, strategy=cs))
+                elif fn is iter_streaming_chunks_joint:
+                    chunks = list(fn(**kw))
+                else:
+                    kw.pop("window_chunks", None)
+                    chunks = list(fn(**kw))
+                last = chunks[-1]
+                dv = (last.video_latent_prefix - ref.video_latent_prefix).abs().max().item()
+                alen = min(last.audio_latent_prefix.shape[2], ref.audio_latent_prefix.shape[2])
+                da = (
+                    last.audio_latent_prefix[:, :, :alen] - ref.audio_latent_prefix[:, :, :alen]
+                ).abs().max().item()
+                print(f"[phaseA ccx={ccx}] {s:15s} vs full_recompute: "
+                      f"video max|diff|={dv:.3e} audio max|diff|={da:.3e}")
+                assert dv < 1e-4 and da < 1e-4, f"single-chunk {s} must match full_recompute (ccx={ccx})"
+
+        # Phase B: multi-chunk (4 generated) finiteness for every strategy.
+        for s in _INTERACTIVE_STRATEGIES:
+            chunks = run_strategy(x0, 5, lambda i, n: (ctx_v, ctx_a), s)
+            last = chunks[-1]
+            assert torch.isfinite(last.video_latent_prefix).all(), f"{s}: non-finite video"
+            assert torch.isfinite(last.audio_latent_prefix).all(), f"{s}: non-finite audio"
+            print(f"[phaseB] {s:15s} {len(chunks)} chunks finite; "
+                  f"video {tuple(last.video_latent_prefix.shape)} audio {tuple(last.audio_latent_prefix.shape)}")
 
     print("\nINTERACTIVE STREAMING VALIDATION PASSED")
 

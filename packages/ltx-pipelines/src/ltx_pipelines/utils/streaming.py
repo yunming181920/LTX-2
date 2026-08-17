@@ -777,6 +777,173 @@ def streaming_generate_joint(  # noqa: PLR0913, PLR0915
     return full_video_latent, full_audio_latent
 
 
+def streaming_generate_joint_image_cond(  # noqa: PLR0913, PLR0915
+    *,
+    sigmas: torch.Tensor,
+    num_generated_latent_frames: int,
+    chunk_frames: int,
+    video_tools_full: VideoLatentTools,
+    audio_tools_full: AudioLatentTools,
+    sink_latent_unpatchified: torch.Tensor,
+    v_context: torch.Tensor,
+    a_context: torch.Tensor,
+    stepper: EulerDiffusionStep,
+    transformer: X0Model,
+    noiser: Noiser,
+    dtype: torch.dtype,
+    device: torch.device,
+    causal_cross_attn: bool = True,
+    cross_attn_lookahead_sec: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Ablation C: AR image-conditioning chain (no KV cache, no attention history).
+
+    Each AR chunk is a fresh TI2V denoise conditioned on the *previous chunk's
+    last generated frame* as the image reference (a rotating sink). The window
+    per chunk is just ``[sink | current]`` (video) / ``[current]`` (audio) — no
+    persistent first chunk, no rolling history. Cross-chunk context is carried
+    solely by the one rotating image-reference frame; there is no self-attention
+    history and no KV cache (full recompute within the tiny per-chunk window).
+
+    Chunk 0's sink is the user-supplied reference image (``sink_latent_unpatchified``,
+    same as M1's sink). After each chunk, the sink is rotated to that chunk's
+    last generated latent frame. Audio is generated jointly with each video
+    chunk and has no cross-chunk history either.
+
+    Structurally a stripped-down :func:`streaming_generate_joint` (M1) with
+    ``history=[]`` on every chunk and a rotating sink. Reuses
+    :func:`_build_window_state` / :class:`JointStreamingTwinDenoiser` /
+    :func:`_build_audio_window_state` / :func:`_audio_window_alignment`.
+    """
+    patchifier = video_tools_full.patchifier
+    audio_patchifier = AudioPatchifier(patch_size=1)
+    h_lat = video_tools_full.target_shape.height
+    w_lat = video_tools_full.target_shape.width
+    channels = video_tools_full.target_shape.channels
+    fps = video_tools_full.fps
+    tokens_per_frame = h_lat * w_lat
+    audio_channels = audio_tools_full.target_shape.channels
+    audio_mel = audio_tools_full.target_shape.mel_bins
+
+    total_latent_frames = video_tools_full.target_shape.frames
+    full_video_latent = torch.zeros(
+        (1, channels, total_latent_frames, h_lat, w_lat), device=device, dtype=dtype
+    )
+    full_video_latent[:, :, 0:1, :, :] = sink_latent_unpatchified[:, :, 0:1, :, :]
+    total_audio_frames = audio_tools_full.target_shape.frames
+    full_audio_latent = torch.zeros(
+        (1, audio_channels, total_audio_frames, audio_mel), device=device, dtype=dtype
+    )
+
+    sink_tokens = _patchify_frame_latent(sink_latent_unpatchified, patchifier)
+    if sink_tokens.shape[1] != tokens_per_frame:
+        sink_tokens = sink_tokens[:, :tokens_per_frame, :].contiguous()
+
+    num_steps = len(sigmas) - 1
+    sigma_mid_step = max(1, num_steps // 2)
+    num_chunks = (num_generated_latent_frames + chunk_frames - 1) // chunk_frames
+    frames_generated_before = 0
+    audio_generated_before = 0
+
+    for i in range(num_chunks):
+        current_video_frames = min(chunk_frames, num_generated_latent_frames - frames_generated_before)
+        frames_through_chunk = frames_generated_before + current_video_frames
+        current_audio_frames = _audio_chunk_frame_count(frames_through_chunk, audio_generated_before, fps)
+
+        # --- video window [sink | current] (no history) ---
+        video_state, sink_range, video_history_ranges, video_current_range = _build_window_state(
+            video_tools=video_tools_full,
+            sink_tokens=sink_tokens,
+            history=[],  # no attention history across chunks
+            current_frames=current_video_frames,
+            tokens_per_frame=tokens_per_frame,
+            noiser=noiser,
+            device=device,
+            dtype=dtype,
+        )
+
+        # --- audio window [current] (no history), clock-aligned to video ---
+        a_abs_start, a_time_shift = _audio_window_alignment(
+            audio_generated_before=audio_generated_before,
+            audio_hist_frames=0,
+            video_abs_current_frame=1 + frames_generated_before,
+            video_rel_current_frame=1,  # no video history
+            fps=fps,
+        )
+        audio_state, audio_history_ranges, audio_current_range = _build_audio_window_state(
+            audio_tools_full=audio_tools_full,
+            history=[],
+            current_frames=current_audio_frames,
+            noiser=noiser,
+            device=device,
+            dtype=dtype,
+            abs_start_frame=a_abs_start,
+            time_shift_sec=a_time_shift,
+        )
+
+        if causal_cross_attn:
+            a2v_mask, v2a_mask = cross_causal_attention_mask(
+                video_state.positions, audio_state.positions, cross_attn_lookahead_sec
+            )
+            video_state = replace(video_state, cross_attention_mask=a2v_mask)
+            audio_state = replace(audio_state, cross_attention_mask=v2a_mask)
+
+        denoiser = JointStreamingTwinDenoiser(
+            v_context=v_context,
+            a_context=a_context,
+            video_sink_tokens=sink_tokens,
+            video_sink_range=sink_range,
+            video_history=[],  # empty -> _inject is a no-op on history
+            video_history_ranges=video_history_ranges,
+            video_current_range=video_current_range,
+            audio_history=[],
+            audio_history_ranges=audio_history_ranges,
+            audio_current_range=audio_current_range,
+            sigma_mid_step=sigma_mid_step,
+            num_steps=num_steps,
+        )
+
+        logger.info(
+            "Joint streaming AR chunk %d/%d (image-cond; video=%d audio=%d frames)",
+            i + 1, num_chunks, current_video_frames, current_audio_frames,
+        )
+
+        video_state, audio_state = euler_denoising_loop(
+            sigmas=sigmas,
+            video_state=video_state,
+            audio_state=audio_state,
+            stepper=stepper,
+            transformer=transformer,
+            denoiser=denoiser,
+        )
+
+        # --- finalize video chunk + rotate sink to this chunk's last frame ---
+        vc0, vc1 = video_current_range
+        video_clean_tokens = video_state.latent[:, vc0:vc1, :].clone()
+        video_clean_unpatchified = _unpatchify_tokens(
+            video_clean_tokens, current_video_frames, h_lat, w_lat, channels, patchifier
+        )
+        f0 = 1 + frames_generated_before
+        full_video_latent[:, :, f0 : f0 + current_video_frames, :, :] = video_clean_unpatchified
+        # Rotate the sink: the next chunk's image reference is this chunk's
+        # last generated latent frame (one latent frame's worth of tokens).
+        sink_tokens = video_clean_tokens[:, -tokens_per_frame:, :].clone()
+
+        # --- finalize audio chunk ---
+        ac0, ac1 = audio_current_range
+        audio_clean_tokens = audio_state.latent[:, ac0:ac1, :].clone()
+        audio_clean_unpatchified = _unpatchify_audio_tokens(
+            audio_clean_tokens, current_audio_frames, audio_channels, audio_mel, audio_patchifier
+        )
+        a0 = audio_generated_before
+        full_audio_latent[:, :, a0 : a0 + current_audio_frames, :] = audio_clean_unpatchified
+
+        frames_generated_before += current_video_frames
+        audio_generated_before += current_audio_frames
+
+    full_audio_latent = _conform_audio_latent(full_audio_latent, total_audio_frames)
+    return full_video_latent, full_audio_latent
+
+
 def _build_audio_window_positions(
     audio_tools: AudioLatentTools,
     hist_frames: int,
@@ -824,6 +991,7 @@ def streaming_generate_joint_cached(  # noqa: PLR0913, PLR0915
     device: torch.device,
     causal_cross_attn: bool = True,
     cross_attn_lookahead_sec: float = 0.0,
+    strategy: str = "twin",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """M2: KV-cache + RoPE repositioning joint streaming TI2V generation.
 
@@ -844,6 +1012,15 @@ def streaming_generate_joint_cached(  # noqa: PLR0913, PLR0915
     forward on the finalized (post-final-Euler-step) latents at sigma 0 per
     chunk — the paper's "clean cache obtained after the final denoising step"
     — rather than from the final step's still-noisy input.
+
+    Strategies (ablation):
+      * ``"twin"`` (default): intermediate steps read the history ``noisy``
+        snapshot (captured at the mid step), the final step reads ``clean``.
+      * ``"clean"`` (ablation A): every step reads the history ``clean``
+        snapshot (pure-clean history).
+      * ``"noisy_steps"`` (ablation B): step ``t`` reads the history's own
+        step-``t`` noisy snapshot (noise-level matched). No clean snapshot;
+        no extra sigma-0 forward.
 
     NOTE: conceptual/unvalidated — extends an already-untested M2 path to a
     second modality with a different (sink-less) layout. Run
@@ -875,12 +1052,18 @@ def streaming_generate_joint_cached(  # noqa: PLR0913, PLR0915
     if sink_tokens.shape[1] != tokens_per_frame:
         sink_tokens = sink_tokens[:, :tokens_per_frame, :].contiguous()
 
-    wrapper = CausalStreamingModel(
-        transformer, window_chunks, tokens_per_frame, cache_audio=True, audio_tokens_per_frame=1
-    )
-
     num_steps = len(sigmas) - 1
     sigma_mid_step = max(1, num_steps // 2)
+    wrapper = CausalStreamingModel(
+        transformer,
+        window_chunks,
+        tokens_per_frame,
+        cache_audio=True,
+        audio_tokens_per_frame=1,
+        strategy=strategy,
+        num_steps=num_steps,
+    )
+
     # Video layout bookkeeping (frame counts; K/V live in the caches).
     first_frames = 0
     rolling_frames: deque[int] = deque(maxlen=window_chunks)
@@ -1019,10 +1202,16 @@ def streaming_generate_joint_cached(  # noqa: PLR0913, PLR0915
             )
 
             # Inline per-step loop: toggle TwinCache snapshot mode, run the cached
-            # model, post-process + euler step, capture K/V at mid/final.
+            # model, post-process + euler step, capture K/V per strategy.
             for step_idx in range(num_steps):
-                mode = "clean" if step_idx == num_steps - 1 else "noisy"
-                wrapper.set_mode(mode)
+                if strategy == "noisy_steps":
+                    # B: read history's own step-t noisy; capture current step-t.
+                    wrapper.set_mode("noisy", step_idx=step_idx)
+                elif strategy == "clean":
+                    # A: read history clean at every step.
+                    wrapper.set_mode("clean")
+                else:  # twin
+                    wrapper.set_mode("clean" if step_idx == num_steps - 1 else "noisy")
                 pos_video = modality_from_latent_state(video_state, v_context, sigmas[step_idx])
                 pos_audio = modality_from_latent_state(audio_state, a_context, sigmas[step_idx])
                 denoised_video, denoised_audio = wrapper(video=pos_video, audio=pos_audio, perturbations=None)
@@ -1032,7 +1221,9 @@ def streaming_generate_joint_cached(  # noqa: PLR0913, PLR0915
                 denoised_audio = post_process_latent(
                     denoised_audio, audio_state.denoise_mask, audio_state.clean_latent
                 )
-                if step_idx == sigma_mid_step:
+                if strategy == "noisy_steps":
+                    wrapper.stash("noisy", step_idx=step_idx)
+                elif step_idx == sigma_mid_step:
                     wrapper.stash("noisy")
                 video_state = replace(
                     video_state, latent=stepper.step(video_state.latent, denoised_video, sigmas, step_idx)
@@ -1041,20 +1232,26 @@ def streaming_generate_joint_cached(  # noqa: PLR0913, PLR0915
                     audio_state, latent=stepper.step(audio_state.latent, denoised_audio, sigmas, step_idx)
                 )
 
-            # Clean-KV refresh (Vidu S1 §2.3.1: the clean cache is "obtained
-            # AFTER the final denoising step"). The loop's last forward saw the
-            # current chunk at sigma[-2] (still noisy), so its K/V are not the
-            # clean snapshot. Run one extra forward on the finalized latents at
-            # sigma 0 — the exact condition under which M1 presents this chunk
-            # as clean history (timestep-0 conditioning tokens) — and stash
-            # that as the "clean" TwinCache entry. Output is discarded.
-            wrapper.set_mode("clean")
-            zero_sigma = torch.zeros_like(sigmas[0])
-            pos_video = modality_from_latent_state(video_state, v_context, zero_sigma)
-            pos_audio = modality_from_latent_state(audio_state, a_context, zero_sigma)
-            wrapper(video=pos_video, audio=pos_audio, perturbations=None)
-            wrapper.stash("clean")
-            wrapper.commit()
+            if strategy == "noisy_steps":
+                # B: no clean snapshot — the per-step noisy K/V are the history.
+                # Finalized latent is whatever the last Euler step produced.
+                wrapper.commit()
+            else:
+                # twin / clean: Clean-KV refresh (Vidu S1 §2.3.1: the clean cache
+                # is "obtained AFTER the final denoising step"). The loop's last
+                # forward saw the current chunk at sigma[-2] (still noisy), so its
+                # K/V are not the clean snapshot. Run one extra forward on the
+                # finalized latents at sigma 0 — the exact condition under which
+                # M1 presents this chunk as clean history (timestep-0 conditioning
+                # tokens) — and stash that as the "clean" TwinCache entry. Output
+                # is discarded.
+                wrapper.set_mode("clean")
+                zero_sigma = torch.zeros_like(sigmas[0])
+                pos_video = modality_from_latent_state(video_state, v_context, zero_sigma)
+                pos_audio = modality_from_latent_state(audio_state, a_context, zero_sigma)
+                wrapper(video=pos_video, audio=pos_audio, perturbations=None)
+                wrapper.stash("clean")
+                wrapper.commit()
             if first_frames == 0:
                 first_frames = current_video_frames  # joined the persistent reference
             else:

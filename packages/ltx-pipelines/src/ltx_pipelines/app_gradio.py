@@ -27,7 +27,7 @@ import logging
 
 import torch
 
-from ltx_core.model.video_vae.tiling import TilingConfig
+from ltx_core.model.video_vae import TileSizeConfig
 from ltx_pipelines.interactive_session import InteractiveStreamingSession
 from ltx_pipelines.utils.args import new_video_gen_arg_parser, resolve_cli_params
 
@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 SESSION: InteractiveStreamingSession | None = None
 
 
-def _build_ui(session: InteractiveStreamingSession) -> "Blocks":  # type: ignore[name-defined]
+def _build_ui(session: InteractiveStreamingSession, default_strategy: str = "full_recompute") -> "Blocks":  # type: ignore[name-defined]
     import gradio as gr
 
     def generate(  # noqa: PLR0913
@@ -53,12 +53,13 @@ def _build_ui(session: InteractiveStreamingSession) -> "Blocks":  # type: ignore
         seed: int,
         causal_cross_attn: bool,
         enhance_prompt: bool,
+        stream_strategy: str,
     ):
         """Generator: drive the session, yielding (video, audio, status) per chunk."""
         if not image_path:
             yield None, None, "⚠️ Please provide a reference image (the sink)."
             return
-        yield None, None, "⏳ Starting generation…"
+        yield None, None, f"⏳ Starting generation ({stream_strategy})…"
         try:
             for update in session.run(
                 initial_prompt=initial_prompt,
@@ -73,7 +74,8 @@ def _build_ui(session: InteractiveStreamingSession) -> "Blocks":  # type: ignore
                 chunk_frames=int(chunk_frames),
                 enhance_prompt=bool(enhance_prompt),
                 causal_cross_attn=bool(causal_cross_attn),
-                tiling_config=TilingConfig.default(),
+                tiling_config=TileSizeConfig.default(),
+                stream_strategy=stream_strategy,
             ):
                 yield update.video_path, update.audio, update.status
         except Exception as exc:  # noqa: BLE001 — surface to the UI status line
@@ -105,6 +107,16 @@ def _build_ui(session: InteractiveStreamingSession) -> "Blocks":  # type: ignore
                     stop_btn = gr.Button("⏹ Stop", variant="stop")
             with gr.Column(scale=1):
                 with gr.Accordion("Generation settings", open=False):
+                    stream_strategy = gr.Dropdown(
+                        choices=["full_recompute", "kv_twin", "kv_clean", "kv_noisy_steps", "image_cond"],
+                        value=default_strategy,
+                        label="Stream strategy",
+                        info=(
+                            "full_recompute=M1 latent TwinCache; kv_twin=M2 KV cache (noisy mid + clean final); "
+                            "kv_clean(A)=M2 clean history; kv_noisy_steps(B)=M2 per-step noisy; "
+                            "image_cond(C)=no cache, per-chunk last-frame ref."
+                        ),
+                    )
                     height = gr.Slider(256, 1024, value=512, step=32, label="Height")
                     width = gr.Slider(256, 1024, value=768, step=32, label="Width")
                     num_frames = gr.Slider(9, 257, value=33, step=8, label="Num frames")
@@ -127,7 +139,7 @@ def _build_ui(session: InteractiveStreamingSession) -> "Blocks":  # type: ignore
             generate,
             inputs=[
                 image_in, initial_prompt, height, width, num_frames, frame_rate,
-                steps, window_chunks, chunk_frames, seed, causal, enhance,
+                steps, window_chunks, chunk_frames, seed, causal, enhance, stream_strategy,
             ],
             outputs=[video_out, audio_out, status_out],
             concurrency_limit=1,
@@ -165,6 +177,15 @@ def main() -> None:
             "Set to a different GPU to split the 12B text encoder from the 22B DiT."
         ),
     )
+    parser.add_argument(
+        "--stream-strategy",
+        choices=["full_recompute", "kv_twin", "kv_clean", "kv_noisy_steps", "image_cond"],
+        default="full_recompute",
+        help="Default streaming strategy for the UI dropdown (changeable per generation in the UI). "
+        "full_recompute = M1 latent TwinCache; kv_twin = M2 KV cache (noisy mid + clean final); "
+        "kv_clean (A) = M2 clean history; kv_noisy_steps (B) = M2 per-step noise-matched history; "
+        "image_cond (C) = no cache, per-chunk last-frame image reference.",
+    )
     args = parser.parse_args()
 
     dit_device = torch.device(args.device) if args.device else None
@@ -172,19 +193,19 @@ def main() -> None:
 
     global SESSION  # noqa: PLW0603 — single shared session for a single-GPU demo
     SESSION = InteractiveStreamingSession(
-        checkpoint_path=args.checkpoint_path,
-        gemma_root=args.gemma_root,
+        model_paths=args.model_paths,
         loras=tuple(args.lora) if args.lora else (),
         device=dit_device,
         text_encoder_device=text_device,
         quantization=args.quantization,
         compilation_config=args.compile,
         offload_mode=args.offload_mode,
+        diffvae_optimization=args.diffvae_optimization,
     )
     logger.info("Loading models (this may take a while)…")
     SESSION.start()
 
-    demo = _build_ui(SESSION)
+    demo = _build_ui(SESSION, default_strategy=args.stream_strategy)
     try:
         demo.launch(server_name=args.host, server_port=args.port, share=args.share)
     finally:
