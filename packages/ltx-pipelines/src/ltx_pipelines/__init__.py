@@ -5,9 +5,10 @@ This package provides ready-to-use pipelines for video generation:
 - T2AOneStagePipeline: Text-to-audio in a single stage (audio-only output)
 - TI2VidTwoStagesPipeline: Two-stage generation with upsampling
 - DistilledPipeline: Fast distilled two-stage generation
+- DubItPipeline: Dub-It with IC-LoRA and audio conditioning
 - ICLoraPipeline: Image/video conditioning with distilled LoRA
-- LipDubPipeline: Lip dubbing with IC-LoRA and audio conditioning
 - KeyframeInterpolationPipeline: Keyframe-based video interpolation
+- DFRPipeline: keyframe slots → spatial detailing → optional tiled temporal x2 (Diffusion Fidelity Rendering)
 - RetakePipeline: Regenerate a time region (retake) of an existing video
 For more detailed components and utilities, import from specific submodules
 like `ltx_pipelines.utils.media_io` or `ltx_pipelines.utils.constants`.
@@ -22,10 +23,11 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ltx_pipelines.a2vid_two_stage import A2VidPipelineTwoStage
+    from ltx_pipelines.dfr_pipeline import DFRPipeline
     from ltx_pipelines.distilled import DistilledPipeline
+    from ltx_pipelines.dubit import DubItPipeline
     from ltx_pipelines.ic_lora import ICLoraPipeline
     from ltx_pipelines.keyframe_interpolation import KeyframeInterpolationPipeline
-    from ltx_pipelines.lipdub import LipDubPipeline
     from ltx_pipelines.retake import RetakePipeline
     from ltx_pipelines.t2a_one_stage import T2AOneStagePipeline
     from ltx_pipelines.ti2vid_one_stage import TI2VidOneStagePipeline
@@ -34,10 +36,11 @@ if TYPE_CHECKING:
 # Public name -> module that defines it. Used for lazy resolution in __getattr__.
 _EXPORTS = {
     "A2VidPipelineTwoStage": "ltx_pipelines.a2vid_two_stage",
+    "DFRPipeline": "ltx_pipelines.dfr_pipeline",
     "DistilledPipeline": "ltx_pipelines.distilled",
+    "DubItPipeline": "ltx_pipelines.dubit",
     "ICLoraPipeline": "ltx_pipelines.ic_lora",
     "KeyframeInterpolationPipeline": "ltx_pipelines.keyframe_interpolation",
-    "LipDubPipeline": "ltx_pipelines.lipdub",
     "RetakePipeline": "ltx_pipelines.retake",
     "T2AOneStagePipeline": "ltx_pipelines.t2a_one_stage",
     "TI2VidOneStagePipeline": "ltx_pipelines.ti2vid_one_stage",
@@ -46,10 +49,11 @@ _EXPORTS = {
 
 __all__ = [
     "A2VidPipelineTwoStage",
+    "DFRPipeline",
     "DistilledPipeline",
+    "DubItPipeline",
     "ICLoraPipeline",
     "KeyframeInterpolationPipeline",
-    "LipDubPipeline",
     "RetakePipeline",
     "T2AOneStagePipeline",
     "TI2VidOneStagePipeline",
