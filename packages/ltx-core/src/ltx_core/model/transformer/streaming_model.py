@@ -8,15 +8,22 @@ leaving all production bidirectional pipelines untouched (their
 
 Two modalities can be cached, selected at construction:
 
-  * **Video** (always): one cache per block's video self-attention (``attn1``),
-    with a 1-frame sink and a persistent first chunk (Vidu S1 §2.3.1). This is
-    the original A2V behaviour — ``cache_audio=False`` leaves audio self-attention
-    on the standard path, so A2V M2 is byte-identical to before.
+  * **Video** (always): one cache per block's video self-attention (``attn1``)
+    with a persistent first chunk. The sink-carrying default (``video_sink_tokens
+    = None`` → one latent frame) is the original A2V behaviour —
+    ``cache_audio=False`` leaves audio self-attention on the standard path, so
+    A2V M2 is byte-identical to before. The joint TI2V path passes
+    ``video_sink_tokens=0``: its first committed chunk is the ``[image |
+    chunk 1]`` anchor from a bidirectional ti2v bootstrap, so there is no
+    separate sink block to recompute.
   * **Audio** (opt-in, ``cache_audio=True``): one cache per block's audio
-    self-attention (``audio_attn1``), with *no* sink and *no* persistent first
-    chunk (audio has no image conditioning) — a pure FIFO ring. Required by the
-    joint streaming TI2V path (M2), where audio is *generated* in lockstep and
-    its self-attention must also be cached for O(window) memory.
+    self-attention (``audio_attn1``), with *no* sink (audio has no image
+    conditioning) but **with** a persistent first chunk — Vidu S1 §2.3.1's
+    persistent reference is the first generated *video-audio* state, so audio
+    keeps its first chunk forever and only later chunks roll through the FIFO
+    ring. Required by the joint streaming TI2V path (M2), where audio is
+    *generated* in lockstep and its self-attention must also be cached for
+    O(window) memory.
 
 The driver (``ltx_pipelines.utils.streaming``) calls:
   * :meth:`prepare_chunk` once per AR chunk with the full-window RoPE
@@ -50,8 +57,13 @@ class CausalStreamingModel(torch.nn.Module):
     """Wraps an X0Model and manages per-block self-attn KV caches.
 
     Caches video self-attention (``attn1``) always, and audio self-attention
-    (``audio_attn1``) only when ``cache_audio=True``. A2V passes
-    ``cache_audio=False`` and is byte-identical to the pre-audio-cache behaviour.
+    (``audio_attn1``) only when ``cache_audio=True``. Both cache flavours pin
+    their first generated chunk. The joint TI2V path bootstraps its first chunk
+    with standard bidirectional ti2v (image at frame 0) and pins the whole
+    ``[image | chunk 1]`` anchor, so it passes ``video_sink_tokens=0`` — the
+    video cache then uses the same no-sink pinned-first layout as audio. The
+    sink-carrying default (``video_sink_tokens=None`` → one latent frame)
+    preserves the A2V behaviour, which passes ``cache_audio=False``.
     """
 
     def __init__(
@@ -60,6 +72,7 @@ class CausalStreamingModel(torch.nn.Module):
         window_chunks: int,
         tokens_per_frame: int,
         *,
+        video_sink_tokens: int | None = None,
         cache_audio: bool = False,
         audio_tokens_per_frame: int = 1,
         strategy: str = "twin",
@@ -73,11 +86,16 @@ class CausalStreamingModel(torch.nn.Module):
         self.strategy = strategy
         self.num_steps = num_steps
         blocks = self.x0.velocity_model.transformer_blocks
-        # Video caches: 1-frame sink + persistent first chunk (Vidu S1 §2.3.1).
+        # Video caches: sink_tokens = one latent frame by default (A2V: 1-frame
+        # sink + persistent first chunk, Vidu S1 §2.3.1). The joint TI2V path
+        # passes video_sink_tokens=0: its first committed chunk is the
+        # [image | chunk 1] anchor (bidirectional ti2v bootstrap), so no
+        # separate sink block is carried.
+        video_sink = tokens_per_frame if video_sink_tokens is None else video_sink_tokens
         self._caches: list[StreamingKVCache] = [
             StreamingKVCache(
                 window_chunks,
-                sink_tokens=tokens_per_frame,
+                sink_tokens=video_sink,
                 persistent_first=True,
                 strategy=strategy,
                 num_steps=num_steps,
@@ -86,16 +104,19 @@ class CausalStreamingModel(torch.nn.Module):
         ]
         for blk, cache in zip(blocks, self._caches):
             blk.attn1.stream_cache = cache
-        # Audio caches: no sink, no persistent first chunk (pure FIFO ring).
-        # Only attached when cache_audio=True; otherwise audio_attn1.stream_cache
-        # stays None and audio self-attention runs the standard (uncached) path.
+        # Audio caches: no sink (audio has no image conditioning) but a
+        # persistent first chunk — Vidu S1 §2.3.1's persistent reference is the
+        # first generated video-audio state, so both modalities pin chunk 1 and
+        # only later chunks roll through the FIFO ring. Only attached when
+        # cache_audio=True; otherwise audio_attn1.stream_cache stays None and
+        # audio self-attention runs the standard (uncached) path.
         self._audio_caches: list[StreamingKVCache] = []
         if cache_audio:
             self._audio_caches = [
                 StreamingKVCache(
                     window_chunks,
                     sink_tokens=0,
-                    persistent_first=False,
+                    persistent_first=True,
                     strategy=strategy,
                     num_steps=num_steps,
                 )

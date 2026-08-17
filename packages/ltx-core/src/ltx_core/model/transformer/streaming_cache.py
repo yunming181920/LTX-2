@@ -33,12 +33,14 @@ Two modality flavours, selected at construction:
     sink tokens (1 latent frame) live in the modality, and the first generated
     chunk occupies the permanent ``_first`` slot (Vidu S1 §2.3.1 persistent
     reference). This is the original A2V/ti2v-video behaviour.
-  * **Audio** (``sink_tokens = 0``, ``persistent_first = False``): audio has no
-    image conditioning, so there is no sink and no permanent first chunk — every
-    chunk goes to the rolling FIFO ring, and the cached layout collapses to
-    ``[history | current]`` (an empty ``[0:0]`` sink slice). Used by the joint
-    streaming TI2V path (M2), where audio is *generated* in lockstep and its
-    self-attention must also be cached for O(window) memory.
+  * **Audio** (``sink_tokens = 0``, ``persistent_first = True``): audio has no
+    image conditioning, so there is no sink — but Vidu S1 §2.3.1's persistent
+    reference is the first generated *video-audio* state, so the first audio
+    chunk is still committed to the permanent ``_first`` slot (clean snapshot,
+    never evicted) and only later chunks roll through the FIFO ring. The cached
+    layout is ``[first | history | current]`` (an empty ``[0:0]`` sink slice).
+    Used by the joint streaming TI2V path (M2), where audio is *generated* in
+    lockstep and its self-attention must also be cached for O(window) memory.
 """
 
 from __future__ import annotations
@@ -106,7 +108,8 @@ class StreamingKVCache:
             raise ValueError("noisy_steps strategy requires num_steps >= 1")
         # Modality flavour (fixed at construction):
         #  * video: sink_tokens = one latent frame, persistent_first = True.
-        #  * audio: sink_tokens = 0, persistent_first = False (pure FIFO ring).
+        #  * audio: sink_tokens = 0, persistent_first = True (first chunk still
+        #    pinned; only the sink is video-specific).
         self.sink_tokens = sink_tokens
         self.persistent_first = persistent_first
         self.strategy = strategy
@@ -241,11 +244,10 @@ class StreamingKVCache:
     def commit(self) -> None:
         """Finalize the pending chunk.
 
-        For a ``persistent_first`` cache (video), the first committed chunk
-        becomes the permanent reference slot (twin/clean: the clean snapshot;
-        noisy_steps: the per-step list) and later chunks append to the FIFO
-        ring. For a non-persistent cache (audio, no sink/anchor), every chunk
-        appends straight to the FIFO ring.
+        For a ``persistent_first`` cache (both modalities in the joint TI2V
+        path), the first committed chunk becomes the permanent reference slot
+        (twin/clean: the clean snapshot; noisy_steps: the per-step list) and
+        later chunks append to the FIFO ring.
         """
         if self.strategy == "noisy_steps":
             # Ensure the per-step list is populated; fill any gaps with an

@@ -17,7 +17,7 @@ that exposes two things the offline driver hides inside its loop:
 It reuses every M1 primitive from :mod:`ltx_pipelines.utils.streaming` unchanged
 (``_build_window_state`` / ``_build_audio_window_state`` /
 :class:`JointStreamingTwinDenoiser` / ``cross_causal_attention_mask`` / the audio
-window-alignment and patchify helpers) plus
+window and patchify helpers) plus
 :func:`ltx_pipelines.utils.samplers.euler_denoising_loop`. The chunk loop body is
 :func:`streaming_generate_joint` verbatim except for the resolved context and the
 per-chunk ``yield`` — so a ``context_resolver`` that returns a constant context
@@ -119,10 +119,13 @@ def iter_streaming_chunks_joint(  # noqa: PLR0913, PLR0915
         filled prefixes are yielded (via :class:`StreamChunk`) so the caller can
         decode and emit incrementally.
 
-    Video history: persistent first chunk (always clean) + rolling FIFO capped at
-    ``window_chunks``. Audio history: rolling FIFO only (no sink, no persistent
-    anchor). The time-causal AV cross-attention mask and the audio-window clock
-    alignment are applied exactly as in M1.
+    Chunk 1 is a standard bidirectional ti2v bootstrap (the reference image
+    replaces latent frame 0, full attention); its ``[image | chunk 1]`` output
+    is the pinned anchor. Video history: anchor (always clean, never evicted)
+    + rolling FIFO capped at ``window_chunks``. Audio history: persistent
+    first chunk (always clean) + rolling FIFO (no sink — audio has no image
+    conditioning). The time-causal AV cross-attention mask and the audio-window
+    layout are applied exactly as in M1.
     """
     patchifier = video_tools_full.patchifier
     audio_patchifier = AudioPatchifier(patch_size=1)
@@ -151,6 +154,7 @@ def iter_streaming_chunks_joint(  # noqa: PLR0913, PLR0915
     num_steps = len(sigmas) - 1
     sigma_mid_step = max(1, num_steps // 2)
     first_ref: ChunkSnapshots | None = None  # video persistent first chunk
+    audio_first: ChunkSnapshots | None = None  # audio persistent first chunk
     rolling_video: deque[ChunkSnapshots] = deque(maxlen=window_chunks)
     rolling_audio: deque[ChunkSnapshots] = deque(maxlen=window_chunks)
 
@@ -166,28 +170,30 @@ def iter_streaming_chunks_joint(  # noqa: PLR0913, PLR0915
         # --- live-prompt hook: resolve THIS chunk's text context (cross-attention only) ---
         v_context, a_context = context_resolver(i, num_chunks)
 
-        # --- video window [sink | first | history | current] ---
+        # Chunk 1 = bidirectional ti2v bootstrap (image replaces frame 0, full
+        # attention); its [image | chunk 1] output becomes the pinned anchor.
+        is_bootstrap = first_ref is None
+
+        # --- video window: [image | current] for the bootstrap, then
+        # [anchor | rolling | current] (the image lives in the anchor's frame 0) ---
         video_history = ([first_ref] if first_ref is not None else []) + list(rolling_video)
         video_state, sink_range, video_history_ranges, video_current_range = _build_window_state(
             video_tools=video_tools_full,
-            sink_tokens=sink_tokens,
+            sink_tokens=sink_tokens if is_bootstrap else None,
             history=video_history,
             current_frames=current_video_frames,
             tokens_per_frame=tokens_per_frame,
             noiser=noiser,
             device=device,
             dtype=dtype,
+            causal=not is_bootstrap,
         )
 
-        # --- audio window [history | current], clock-aligned to the video window ---
-        audio_history = list(rolling_audio)
-        a_abs_start, a_time_shift = _audio_window_alignment(
-            audio_generated_before=audio_generated_before,
-            audio_hist_frames=sum(s.frames for s in audio_history),
-            video_abs_current_frame=1 + frames_generated_before,
-            video_rel_current_frame=1 + sum(s.frames for s in video_history),
-            fps=fps,
-        )
+        # --- audio window [first | history | current]: fresh window-relative
+        # grid (the pinned first chunk makes the audio window's head match the
+        # video window's persistent reference; both rolling sections compress
+        # by the identical evicted span, so no clock realignment is needed) ---
+        audio_history = ([audio_first] if audio_first is not None else []) + list(rolling_audio)
         audio_state, audio_history_ranges, audio_current_range = _build_audio_window_state(
             audio_tools_full=audio_tools_full,
             history=audio_history,
@@ -195,12 +201,11 @@ def iter_streaming_chunks_joint(  # noqa: PLR0913, PLR0915
             noiser=noiser,
             device=device,
             dtype=dtype,
-            abs_start_frame=a_abs_start,
-            time_shift_sec=a_time_shift,
+            causal=not is_bootstrap,
         )
 
-        # --- time-causal AV cross-attention masks (window-relative positions) ---
-        if causal_cross_attn:
+        # --- time-causal AV cross-attention masks (skipped on the bootstrap) ---
+        if causal_cross_attn and not is_bootstrap:
             a2v_mask, v2a_mask = cross_causal_attention_mask(
                 video_state.positions, audio_state.positions, cross_attn_lookahead_sec
             )
@@ -210,7 +215,7 @@ def iter_streaming_chunks_joint(  # noqa: PLR0913, PLR0915
         denoiser = JointStreamingTwinDenoiser(
             v_context=v_context,
             a_context=a_context,
-            video_sink_tokens=sink_tokens,
+            video_sink_tokens=sink_tokens if is_bootstrap else None,
             video_sink_range=sink_range,
             video_history=video_history,
             video_history_ranges=video_history_ranges,
@@ -241,8 +246,11 @@ def iter_streaming_chunks_joint(  # noqa: PLR0913, PLR0915
         vc0, vc1 = video_current_range
         video_clean_tokens = video_state.latent[:, vc0:vc1, :].clone()
         if first_ref is None:
+            # Anchor = [image | chunk 1]: the frozen image frame plus this
+            # chunk's clean frames, pinned as one history entry (always clean).
+            anchor_tokens = video_state.latent[:, 0 : tokens_per_frame * (1 + current_video_frames), :].clone()
             first_ref = ChunkSnapshots(
-                tokens_noisy=video_clean_tokens, tokens_clean=video_clean_tokens, frames=current_video_frames
+                tokens_noisy=anchor_tokens, tokens_clean=anchor_tokens, frames=1 + current_video_frames
             )
         else:
             v_noisy = (
@@ -259,17 +267,24 @@ def iter_streaming_chunks_joint(  # noqa: PLR0913, PLR0915
         f0 = 1 + frames_generated_before
         full_video_latent[:, :, f0 : f0 + current_video_frames, :, :] = video_clean_unpatchified
 
-        # --- finalize audio chunk ---
+        # --- finalize audio chunk (chunk 1 joins the persistent reference,
+        # mirroring the video first chunk: its noisy slot holds the clean
+        # snapshot, so it always reads clean at every step) ---
         ac0, ac1 = audio_current_range
         audio_clean_tokens = audio_state.latent[:, ac0:ac1, :].clone()
-        a_noisy = (
-            denoiser.noisy_capture_audio.clone()
-            if denoiser.noisy_capture_audio is not None
-            else audio_clean_tokens.clone()
-        )
-        rolling_audio.append(
-            ChunkSnapshots(tokens_noisy=a_noisy, tokens_clean=audio_clean_tokens, frames=current_audio_frames)
-        )
+        if audio_first is None:
+            audio_first = ChunkSnapshots(
+                tokens_noisy=audio_clean_tokens, tokens_clean=audio_clean_tokens, frames=current_audio_frames
+            )
+        else:
+            a_noisy = (
+                denoiser.noisy_capture_audio.clone()
+                if denoiser.noisy_capture_audio is not None
+                else audio_clean_tokens.clone()
+            )
+            rolling_audio.append(
+                ChunkSnapshots(tokens_noisy=a_noisy, tokens_clean=audio_clean_tokens, frames=current_audio_frames)
+            )
         audio_clean_unpatchified = _unpatchify_audio_tokens(
             audio_clean_tokens, current_audio_frames, audio_channels, audio_mel, audio_patchifier
         )
@@ -353,6 +368,7 @@ def iter_streaming_chunks_joint_cached(  # noqa: PLR0913, PLR0915
         transformer,
         window_chunks,
         tokens_per_frame,
+        video_sink_tokens=0,  # first committed chunk = [image | chunk 1] anchor
         cache_audio=True,
         audio_tokens_per_frame=1,
         strategy=strategy,
@@ -361,6 +377,7 @@ def iter_streaming_chunks_joint_cached(  # noqa: PLR0913, PLR0915
 
     first_frames = 0
     rolling_frames: deque[int] = deque(maxlen=window_chunks)
+    first_audio_frames = 0
     rolling_audio_frames: deque[int] = deque(maxlen=window_chunks)
     num_chunks = (num_generated_latent_frames + chunk_frames - 1) // chunk_frames
     frames_generated_before = 0
@@ -374,12 +391,17 @@ def iter_streaming_chunks_joint_cached(  # noqa: PLR0913, PLR0915
 
             v_context, a_context = context_resolver(i, num_chunks)
 
+            # Chunk 1 = bidirectional ti2v bootstrap ([image | current], no
+            # causal masks); later chunks: [anchor | rolling | current], the
+            # anchor = [image | chunk 1] pinned in the caches' _first slots.
+            is_bootstrap = first_frames == 0
             v_hist_frames = first_frames + sum(rolling_frames)
-            v_sink_t = tokens_per_frame
+            v_sink_t = tokens_per_frame if is_bootstrap else 0
             v_hist_t = v_hist_frames * tokens_per_frame
             v_cur_t = current_video_frames * tokens_per_frame
             full_positions, _, _, _ = _build_window_positions(
-                video_tools_full, v_hist_frames, current_video_frames, device
+                video_tools_full, v_hist_frames, current_video_frames, device,
+                sink_frames=1 if is_bootstrap else 0,
             )
             v_window_pe = _window_pe(full_positions, wrapper, dtype)
             v_full_tokens = full_positions.shape[2]
@@ -392,25 +414,24 @@ def iter_streaming_chunks_joint_cached(  # noqa: PLR0913, PLR0915
             v_full_frame_indices = torch.arange(v_full_window_frames, device=device).repeat_interleave(
                 tokens_per_frame
             )
-            v_sink_rows = torch.arange(0, v_sink_t, device=device)
-            v_current_rows = torch.arange(v_sink_t + v_hist_t, v_sink_t + v_hist_t + v_cur_t, device=device)
-            v_query_rows = torch.cat([v_sink_rows, v_current_rows])
-            v_query_mask = block_causal_attention_mask(
-                v_full_frame_indices[v_query_rows], v_full_frame_indices
-            )
+            if is_bootstrap:
+                # Bidirectional bootstrap: the whole [image | current] window is
+                # queried, full attention (no causal query mask).
+                v_query_rows = torch.arange(0, v_sink_t + v_cur_t, device=device)
+                v_query_mask = None
+            else:
+                v_query_rows = torch.arange(v_hist_t, v_hist_t + v_cur_t, device=device)
+                v_query_mask = block_causal_attention_mask(
+                    v_full_frame_indices[v_query_rows], v_full_frame_indices
+                )
 
-            a_hist_t = sum(rolling_audio_frames)
+            # Audio window [first | history | current]: fresh window-relative
+            # grid (pinned first chunk matches the video window's head; both
+            # rolling sections compress by the identical evicted span).
+            a_hist_t = first_audio_frames + sum(rolling_audio_frames)
             a_cur_t = current_audio_frames
-            a_abs_start, a_time_shift = _audio_window_alignment(
-                audio_generated_before=audio_generated_before,
-                audio_hist_frames=a_hist_t,
-                video_abs_current_frame=1 + frames_generated_before,
-                video_rel_current_frame=1 + v_hist_frames,
-                fps=fps,
-            )
             a_full_positions, _, _ = _build_audio_window_positions(
-                audio_tools_full, a_hist_t, current_audio_frames, device,
-                abs_start_frame=a_abs_start, time_shift_sec=a_time_shift,
+                audio_tools_full, a_hist_t, current_audio_frames, device
             )
             a_window_pe = _window_pe(a_full_positions, wrapper, dtype, audio=True)
             a_full_tokens = a_full_positions.shape[2]
@@ -421,17 +442,27 @@ def iter_streaming_chunks_joint_cached(  # noqa: PLR0913, PLR0915
                 )
             a_full_frame_indices = torch.arange(a_full_tokens, device=device)
             a_current_rows = torch.arange(a_hist_t, a_hist_t + a_cur_t, device=device)
-            a_query_mask = block_causal_attention_mask(
-                a_full_frame_indices[a_current_rows], a_full_frame_indices
+            a_query_mask = (
+                None
+                if is_bootstrap
+                else block_causal_attention_mask(a_full_frame_indices[a_current_rows], a_full_frame_indices)
             )
 
+            # Video modality: [image | current] on the bootstrap (image
+            # frozen, current noised), [current] afterwards. Noise is drawn
+            # over the FULL video window and sliced so the generator
+            # consumption matches M1 (same seed => same chunk noise).
             v_window_noise = torch.randn(
                 (1, v_sink_t + v_hist_t + v_cur_t, channels), device=device, dtype=dtype, generator=noiser.generator
             )
             v_cur_noise = v_window_noise[:, v_sink_t + v_hist_t :, :]
-            v_mod_latent = torch.cat([sink_tokens, v_cur_noise], dim=1)
-            v_mod_clean = torch.zeros_like(v_mod_latent)
-            v_mod_clean[:, :v_sink_t] = sink_tokens
+            if is_bootstrap:
+                v_mod_latent = torch.cat([sink_tokens, v_cur_noise], dim=1)
+                v_mod_clean = torch.zeros_like(v_mod_latent)
+                v_mod_clean[:, :v_sink_t] = sink_tokens
+            else:
+                v_mod_latent = v_cur_noise
+                v_mod_clean = torch.zeros_like(v_mod_latent)
             v_mod_mask = torch.zeros((1, v_mod_latent.shape[1], 1), device=device, dtype=torch.float32)
             v_mod_mask[:, v_sink_t:] = 1.0
             v_mod_positions = full_positions[:, :, v_query_rows, :]
@@ -453,7 +484,7 @@ def iter_streaming_chunks_joint_cached(  # noqa: PLR0913, PLR0915
                 clean_latent=a_mod_clean, attention_mask=None,
             )
 
-            if causal_cross_attn:
+            if causal_cross_attn and not is_bootstrap:
                 a2v_mask, v2a_mask = cross_causal_attention_mask(
                     video_state.positions, audio_state.positions, cross_attn_lookahead_sec
                 )
@@ -508,10 +539,13 @@ def iter_streaming_chunks_joint_cached(  # noqa: PLR0913, PLR0915
                 wrapper.stash("clean")
                 wrapper.commit()
             if first_frames == 0:
-                first_frames = current_video_frames
+                first_frames = 1 + current_video_frames  # anchor = image + chunk 1
             else:
                 rolling_frames.append(current_video_frames)
-            rolling_audio_frames.append(current_audio_frames)
+            if first_audio_frames == 0:
+                first_audio_frames = current_audio_frames
+            else:
+                rolling_audio_frames.append(current_audio_frames)
 
             v_clean_tokens = video_state.latent[:, v_sink_t : v_sink_t + v_cur_t, :].clone()
             v_clean_unpatchified = _unpatchify_tokens(

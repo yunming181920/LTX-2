@@ -120,7 +120,10 @@ def main() -> None:
     x0 = build_tiny()
     with torch.inference_mode():
         # Phase 1: single chunk (2 latent frames -> 1 generated), no history.
-        # Every strategy must agree bit-close (no history => identical paths).
+        # The four streaming strategies share the bidirectional ti2v bootstrap
+        # and must agree bit-close (no history => identical paths). image_cond
+        # keeps its all-causal rotating-sink path, so its single-chunk output
+        # legitimately differs from the bootstrapped strategies — finite only.
         for ccx in (False, True):
             outs = {s: run(x0, 2, strategy=s, causal_cross_attn=ccx) for s in _STRATEGIES}
             ref_v, ref_a = outs["full_recompute"]
@@ -129,7 +132,10 @@ def main() -> None:
                 da = (ref_a - a).abs().max().item()
                 print(f"[phase1 ccx={ccx}] {s:15s} vs full_recompute: "
                       f"video max|diff|={dv:.3e} audio max|diff|={da:.3e}")
-                assert dv < 1e-4 and da < 1e-4, f"single-chunk {s} must match full_recompute (ccx={ccx})"
+                if s == "image_cond":
+                    assert torch.isfinite(v).all() and torch.isfinite(a).all(), f"non-finite latents ({s})"
+                else:
+                    assert dv < 1e-4 and da < 1e-4, f"single-chunk {s} must match full_recompute (ccx={ccx})"
 
         # Phase 2: 8 generated chunks, window 2 -> deep eviction; causal cross ON.
         for s in _STRATEGIES:

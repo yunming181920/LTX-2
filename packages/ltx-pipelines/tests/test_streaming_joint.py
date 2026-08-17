@@ -137,62 +137,91 @@ def test_joint_cross_mask_shapes() -> None:
 
 
 def test_audio_window_clock_alignment() -> None:
-    """After eviction the audio window's clock must match the video window's
-    compressed clock: the audio *current* chunk must be able to see the video
-    *current* frame under the strict time-causal v2a mask (this is exactly what
-    breaks without the alignment — audio would see video current as future)."""
+    """With the audio first chunk pinned (like the video window's), both windows
+    are fresh window-relative grids and must share one clock — even in the
+    steady state (evictions well underway): the audio *current* chunk must see
+    the video *current* frame, and the video *first* row must see the pinned
+    audio *first* chunk (a genuinely visible key, not the earliest-key
+    fallback), under the strict time-causal cross mask."""
     device = torch.device("cpu")
     fps = 25.0
     window_chunks, chunk_frames = 4, 1
-    audio_per_chunk = 8  # fps=25 -> 8 audio latent frames per video latent frame
-    k = 10  # steady-state AR chunk index (evictions well underway)
+    a_per_chunk = 8  # fps=25 -> 8 audio latent frames per video latent frame
 
-    frames_generated_before = (k - 1) * chunk_frames
-    audio_generated_before = 0
-    # Replay the cumulative audio tiling up to chunk k.
-    for g in range(1, k):
-        audio_generated_before += _audio_chunk_frame_count(g * chunk_frames, audio_generated_before, fps)
-
+    # Steady state: first chunk + full rolling ring, evictions well underway.
+    # Video window [sink | first | rolling | current], fresh grid.
     v_hist_frames = chunk_frames * (1 + window_chunks)  # first + rolling
-    a_hist_frames = audio_per_chunk * window_chunks
-
-    abs_start, time_shift = _audio_window_alignment(
-        audio_generated_before=audio_generated_before,
-        audio_hist_frames=a_hist_frames,
-        video_abs_current_frame=1 + frames_generated_before,
-        video_rel_current_frame=1 + v_hist_frames,
-        fps=fps,
-    )
-    assert abs_start == audio_generated_before - a_hist_frames
-    assert time_shift > 0, "steady state must have a positive video compression shift"
-
-    # Video window positions (window-relative seconds), 1 token per frame.
     window_frames = 1 + v_hist_frames + chunk_frames
     vpos = torch.zeros(1, 3, window_frames, 2)
     for f in range(window_frames):
         s, e = _video_latent_frame_bounds_sec(f, fps)
         vpos[0, 0, f, 0], vpos[0, 0, f, 1] = s, e
 
-    # Audio window positions on the aligned clock.
-    a_window = a_hist_frames + audio_per_chunk
-    patchifier = AudioPatchifier(patch_size=1, shift=abs_start)
-    apos = patchifier.get_patch_grid_bounds(AudioLatentShape(1, 8, a_window, 16), device) - time_shift
+    # Audio window [first | rolling | current], fresh grid (shift 0, no
+    # realignment — the same construction as the video window's).
+    a_first = a_per_chunk
+    a_rolling = a_per_chunk * window_chunks
+    a_cur = a_per_chunk
+    a_window = a_first + a_rolling + a_cur
+    apos = AudioPatchifier(patch_size=1).get_patch_grid_bounds(AudioLatentShape(1, 8, a_window, 16), device)
 
     a2v, v2a = cross_causal_attention_mask(vpos, apos, lookahead_sec=0.0)
     v_cur = window_frames - 1
-    a_cur0 = a_hist_frames
+    a_cur0 = a_first + a_rolling
     # The tail of the audio current chunk overlaps the video current frame in
-    # absolute time, so under the aligned clock it must see it.
-    assert v2a[0, a_cur0 + audio_per_chunk - 1, v_cur] == 1, (
-        "aligned clock: last audio current frame must see the video current frame"
+    # wall time, so on the shared fresh clock it must see it.
+    assert v2a[0, a_cur0 + a_cur - 1, v_cur] == 1, (
+        "shared fresh clock: last audio current frame must see the video current frame"
     )
-    # Without alignment (raw window-relative audio grid) it cannot — the bug.
-    apos_raw = AudioPatchifier(patch_size=1).get_patch_grid_bounds(AudioLatentShape(1, 8, a_window, 16), device)
-    _, v2a_raw = cross_causal_attention_mask(vpos, apos_raw, lookahead_sec=0.0)
-    assert torch.all(v2a_raw[0, a_cur0:, v_cur] == 0), (
-        "sanity: the unaligned clock should hide video current from audio current"
+    # The video first row sits next to the pinned audio first chunk and must
+    # see it as ordinary causal keys (all of chunk 1's frames start before the
+    # video first frame ends) — not via the single-key fallback.
+    assert torch.all(a2v[0, 1, :a_first] == 1), (
+        "video first row must see the pinned audio first chunk"
     )
-    print(f"[clock-align] shift={time_shift:.3f}s abs_start={abs_start}: audio current sees video current OK")
+    assert torch.all(a2v.sum(dim=-1) >= 1) and torch.all(v2a.sum(dim=-1) >= 1)
+    print("[clock-align] pinned-first audio window shares the video fresh clock OK")
+
+
+def test_audio_window_alignment_image_cond() -> None:
+    """The history-less ``image_cond`` path (rotating sink) still aligns its
+    ``[current]``-only audio grid onto the rotating video window's compressed
+    clock via :func:`_audio_window_alignment`."""
+    device = torch.device("cpu")
+    fps = 25.0
+    k = 10  # steady-state AR chunk index (rotations well underway)
+    a_per_chunk = 8
+
+    frames_generated_before = k - 1  # chunk_frames = 1
+    audio_generated_before = a_per_chunk * (k - 1)
+
+    # Video window [sink | current] (rotating sink, no history): the current
+    # chunk sits at fresh frames [1, 2).
+    abs_start, time_shift = _audio_window_alignment(
+        audio_generated_before=audio_generated_before,
+        audio_hist_frames=0,
+        video_abs_current_frame=1 + frames_generated_before,
+        video_rel_current_frame=1,
+        fps=fps,
+    )
+    assert abs_start == audio_generated_before
+    assert time_shift > 0, "steady state must have a positive video compression shift"
+
+    vpos = torch.zeros(1, 3, 2, 2)
+    for f in range(2):
+        s, e = _video_latent_frame_bounds_sec(f, fps)
+        vpos[0, 0, f, 0], vpos[0, 0, f, 1] = s, e
+    apos = (
+        AudioPatchifier(patch_size=1, shift=abs_start)
+        .get_patch_grid_bounds(AudioLatentShape(1, 8, a_per_chunk, 16), device)
+        - time_shift
+    )
+
+    _, v2a = cross_causal_attention_mask(vpos, apos, lookahead_sec=0.0)
+    assert v2a[0, a_per_chunk - 1, 1] == 1, (
+        "aligned clock: last audio current frame must see the rotating-sink video current frame"
+    )
+    print(f"[clock-align image_cond] shift={time_shift:.3f}s abs_start={abs_start}: audio current sees video current OK")
 
 
 def test_cross_mask_empty_row_fallback() -> None:

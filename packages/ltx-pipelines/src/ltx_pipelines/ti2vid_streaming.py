@@ -7,16 +7,20 @@ Unlike an audio-to-video (A2V) streaming setup (where audio is a frozen control
 signal and only video is generated), TI2V has no audio input:
 it generates **both** video and audio. This pipeline generates them chunk by
 chunk in lockstep — each video AR chunk also produces its time-aligned audio
-latent frames — with a sliding window, persistent reference context per Vidu S1
-§2.3.1 (the encoded first-frame "sink" plus the first generated *video* chunk,
-fixed and never evicted), latent-level TwinCache (noisy/clean history snapshots
-swapped per denoising step) for **both** modalities, block-causal self-attention
-masks on both temporal axes, and a time-causal video↔audio cross-attention mask.
+latent frames — with a sliding window and a persistent anchor per Vidu S1
+§2.3.1: chunk 1 is a standard **bidirectional ti2v bootstrap** (the encoded
+first-frame image replaces latent frame 0, frozen, full attention), and the
+whole ``[image | chunk 1]`` output is pinned as the never-evicted anchor;
+later chunks stream causally over ``[anchor | history | current]`` with
+latent-level TwinCache (noisy/clean history snapshots swapped per denoising
+step) for **both** modalities, block-causal self-attention masks on both
+temporal axes, and a time-causal video↔audio cross-attention mask.
 
-Audio keeps its own sliding-window FIFO history (no sink / no persistent anchor
-— audio has no image conditioning), so per-step activation memory is O(window)
-for both modalities. The full latents are decoded once at the end (causal-VAE
-seamless video decode + audio decode) and returned.
+Audio keeps its own sliding-window history (no sink — audio has no image
+conditioning — but a pinned first chunk, the audio half of Vidu S1 §2.3.1's
+first generated video-audio reference), so per-step activation memory is
+O(window) for both modalities. The full latents are decoded once at the end
+(causal-VAE seamless video decode + audio decode) and returned.
 
 Two paths:
   * **M1** (default): latent TwinCache, full per-step recompute of history

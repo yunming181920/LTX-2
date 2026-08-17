@@ -50,8 +50,12 @@ now on the **LTX-2.5** split-pack checkpoints. Per the chosen scope:
 - **Inference only** — no training (Stages 1–3 are skipped).
 - **Joint video + audio generation** — TI2V has no audio input; both modalities
   are generated chunk-by-chunk in lockstep.
-- **Full-fidelity streaming machinery** — causal masks + sliding window + sink +
-  TwinCache + KV cache + RoPE repositioning, for *both* video and audio.
+- **Full-fidelity streaming machinery** — causal masks + sliding window +
+  persistent anchor + TwinCache + KV cache + RoPE repositioning, for *both*
+  video and audio. Chunk 1 is a standard **bidirectional ti2v bootstrap** (the
+  reference image replaces latent frame 0, full attention); its `[image |
+  chunk 1]` output is the never-evicted anchor of every later causal window
+  `[anchor | history | current]`.
 - **Five streaming strategies** (one M1 full-recompute + three M2 KV-cache
   variants + one image-conditioning baseline) for ablation — selectable per
   generation from the CLI or the webui dropdown.
@@ -171,7 +175,7 @@ Five strategies, selectable per run (ablation):
 | Flag | Default | Meaning |
 |---|---|---|
 | `--stream-strategy` | `full_recompute` | One of `full_recompute` / `kv_twin` / `kv_clean` / `kv_noisy_steps` / `image_cond` |
-| `--window-chunks` | 4 | Sliding-window rolling-history size in AR chunks (TwinCache FIFO cap; video sink + first chunk are persistent, not counted) |
+| `--window-chunks` | 4 | Sliding-window rolling-history size in AR chunks (TwinCache FIFO cap; the persistent items — video anchor `[image | chunk 1]`, audio first chunk — are not counted) |
 | `--chunk-frames` | 1 | Latent video frames generated per AR step (1 = finest granularity); each step also generates time-aligned audio frames |
 | `--causal-cross-attn` / `--no-causal-cross-attn` | on | Time-causal mask on video↔audio cross-attention (default ON, paper-faithful; train/test mismatch on the bidirectional base model) |
 | `--cross-attn-lookahead-seconds` | 0.0 | Seconds of future audio a video frame may attend under causal cross-attn (0 = strict causal) |
@@ -185,17 +189,58 @@ Standard LTX-2 flags (`--seed`, `--quantization`, `--offload`, `--compile`,
 
 - **M1 — correct-but-slow, no core changes** (`streaming.py::streaming_generate_joint`):
   block-causal mask through `Modality.attention_mask`, latent-level TwinCache for
-  *both* modalities (history snapshots injected per step; sink+history frozen via
-  `denoise_mask=0` so the Euler velocity stays 0). Audio gets its own
-  `[history | current]` window. The CLI default `full_recompute` and `image_cond`
-  strategies are M1-family.
+  *both* modalities (history snapshots injected per step; anchor+history frozen
+  via `denoise_mask=0` so the Euler velocity stays 0). Chunk 1 is a
+  **bidirectional ti2v bootstrap** — the image replaces latent frame 0, no
+  causal masks — and its `[image | chunk 1]` output is pinned as the anchor
+  (always clean, never evicted); later windows are `[anchor | history |
+  current]`. Audio gets its own `[first | history | current]` window — the
+  first chunk pinned and always clean, mirroring the video anchor (Vidu S1
+  §2.3.1's persistent reference is the first generated *video-audio* state).
+  The CLI default `full_recompute` and `image_cond` strategies are M1-family.
 - **M2 — KV cache + RoPE repositioning** (`streaming.py::streaming_generate_joint_cached`
   + `streaming_cache.py` + `streaming_model.py` + `attention.py`): per-block KV
   cache on **both** video self-attn (`attn1`) and audio self-attn (`audio_attn1`),
   history K/V spliced from the cache, RoPE reapplied with the full-window
-  `window_pe`. The `kv_twin` / `kv_clean` / `kv_noisy_steps` strategies are M2-family;
-  the `strategy=` arg selects which TwinCache variant each cache uses. Production
-  pipelines are untouched (`*.stream_cache` stays `None` → byte-identical standard path).
+  `window_pe`. The bidirectional bootstrap commits its `[image | chunk 1]` K/V
+  straight into the caches' permanent first slots (no separate sink block to
+  recompute each step). The `kv_twin` / `kv_clean` / `kv_noisy_steps` strategies
+  are M2-family; the `strategy=` arg selects which TwinCache variant each cache
+  uses. Production pipelines are untouched (`*.stream_cache` stays `None` →
+  byte-identical standard path).
+
+### Design note: why a bidirectional anchor bootstrap (not the paper's sink)
+
+Vidu S1 runs on its own Vidu base model — by all indications a
+full-self-attention architecture over image / video / audio / text with
+MMRoPE-style positional encoding (the same family as MiniMax H3). There the
+§2.3.1 sink is a first-class, *trained* component. Porting it onto LTX-2 hits
+concrete architectural obstacles:
+
+1. **The sink's K/V are not stationary in LTX-2.** Video tokens cross-attend
+   to audio (and vice versa) at every block, so a pinned first-frame token's
+   features depend on the current audio slice: the paper's "constructed once,
+   remains fixed" cache would freeze stale cross-modal state, while
+   recomputing the sink's K/V every step pays full price for one frame the
+   checkpoint was never trained to use that way.
+2. **The base is bidirectional.** A permanently pinned single-frame reference
+   inside a causal window is a train/test mismatch at the most influential
+   position of the stream — the anchor that every later chunk attends to.
+
+So chunk 1 is generated with **standard ti2v** (the reference image replaces
+latent frame 0, full attention — exactly how LTX-2 was trained), and the whole
+`[image | chunk 1]` output becomes the pinned anchor. The paper's
+persistent-reference *content* (first frame + first generated video-audio
+state) survives intact inside one pinned chunk, with no special sink
+mechanics left to maintain.
+
+On the text side: Vidu S1's interface is conversational. The closest relatives
+available today — MiniMax H3, and JoyAI-Echo (jd-opensource, an autoregressive
+video model built on LTX-2.3) — drive generation with formatted/structured
+prompt schemas rather than dialogue. LTX-2's text conditioning (Gemma,
+natural-language prompts) is exactly the simple, natural-language kind, so
+*interactive* descriptions fill Vidu S1's conversational role here — see the
+live-prompt Gradio app below.
 
 ### Interactive streaming (Gradio webui, live prompt injection)
 
@@ -205,7 +250,7 @@ built once) generates chunk-by-chunk and **streams** the growing video + live au
 a browser. While it streams, editing the **live prompt** textbox rewrites the
 cross-attention conditioning for the *next* chunk — so the generated content changes
 mid-clip. This is safe because text is cross-attention only: it is **not** part of the
-cached self-attention history or the sink, so a prompt change does **not** reset the
+cached self-attention history or the anchor, so a prompt change does **not** reset the
 video or invalidate the sliding-window state.
 
 The **Stream strategy** dropdown in the “Generation settings” panel exposes the same
@@ -223,7 +268,7 @@ uv run python -m ltx_pipelines.app_gradio \
     --stream-strategy kv_clean
 ```
 
-Open the printed URL, upload a reference image (the sink), set the initial prompt,
+Open the printed URL, upload a reference image (it becomes the anchor's frame 0), set the initial prompt,
 hit **Generate**, and edit the live prompt while it streams. `--host/--port/--share`
 control serving; `--device` / `--text-encoder-device` can split the 12B text encoder
 onto a second GPU.
@@ -250,8 +295,11 @@ uv run python packages/ltx-pipelines/tests/test_streaming_tiny_model.py     # ti
 uv run python packages/ltx-pipelines/tests/test_streaming_interactive.py   # interactive: 5-strategy parity + finiteness
 ```
 
-`test_streaming_tiny_model.py` asserts single-chunk parity across all five strategies
-(no history ⇒ identical) and multi-chunk finiteness; `test_streaming_interactive.py`
+`test_streaming_tiny_model.py` asserts single-chunk parity across the four
+streaming strategies (no history ⇒ identical; they share the bidirectional
+bootstrap) with `image_cond` checked for finiteness (its all-causal
+rotating-sink path legitimately differs on chunk 1), plus multi-chunk
+finiteness; `test_streaming_interactive.py`
 does the same for the Gradio/interactive driver (plus the live-prompt swap guarantee
 and resolver call-count). Run on a GPU before trusting M2 in production.
 
@@ -259,17 +307,22 @@ and resolver call-count). Run on a GPU before trusting M2 in production.
 
 1. **No training (Stages 1–3).** The bidirectional checkpoint is used as-is as the
    causal model — the largest quality gap.
-2. **No Stage-3 distillation.** Generation uses the full step count (default 30, or 15
+2. **Bidirectional chunk-1 bootstrap.** The first chunk is denoised with full
+   (non-causal) attention to match the base model's training and anchor the
+   stream on a high-quality ti2v output; the paper's causal model generates it
+   causally. Later chunks are causal as in the paper. (Rationale in the design
+   note above.)
+3. **No Stage-3 distillation.** Generation uses the full step count (default 30, or 15
    for the distilled checkpoint), not 3 steps. The paper’s 42 FPS / 540p headline is
    unreachable without distillation + the §2.3.2 infra stack.
-3. **No §2.3.2 inference infrastructure.** SageAttention / SpargeAttention / SLA,
+4. **No §2.3.2 inference infrastructure.** SageAttention / SpargeAttention / SLA,
    custom W8A8 GEMM, kernel fusion, CUDA Graph, Ulysses multi-GPU parallelism are
    not implemented. LTX-2’s own `fp8-cast` / `fp8-scaled-mm` quantization and
    FlashAttention still work.
-4. **AV cross-attention causal mask is ON by default** — a train/test mismatch on
+5. **AV cross-attention causal mask is ON by default** — a train/test mismatch on
    the bidirectional base model, but preferred for paper-faithful causality
    (`--no-causal-cross-attn` to disable).
-5. **No CFG.** `--negative-prompt` is encoded but unused (single forward pass).
+6. **No CFG.** `--negative-prompt` is encoded but unused (single forward pass).
 
 ### Files added / changed by this fork
 
@@ -286,12 +339,14 @@ and resolver call-count). Run on a GPU before trusting M2 in production.
 - `packages/ltx-pipelines/src/ltx_pipelines/app_gradio.py` — Gradio webui (Stream
   strategy dropdown).
 - `packages/ltx-core/src/ltx_core/model/transformer/streaming_cache.py` —
-  `StreamingKVCache` (twin / clean / noisy_steps strategies; video sink+persistent /
-  audio no-sink FIFO).
+  `StreamingKVCache` (twin / clean / noisy_steps strategies; persistent-first
+  slots — the joint TI2V video cache commits the `[image | chunk 1]` anchor,
+  audio pins its first chunk; both no-sink, A2V keeps the sink-carrying
+  default).
 - `packages/ltx-core/src/ltx_core/model/transformer/streaming_model.py` —
   `CausalStreamingModel` (video + optional audio caches; threads strategy/step_idx).
 - `packages/ltx-core/src/ltx_core/model/transformer/attention.py` — `stream_cache`
-  attr + `_stream_cached_forward` (sink-less layout for audio; strategy-agnostic).
+  attr + `_stream_cached_forward` (sink-less layouts for both modalities; strategy-agnostic).
 - `packages/ltx-pipelines/tests/test_streaming_{joint,tiny_model,interactive}.py` —
   pure-tensor / tiny-model / interactive tests covering all five strategies.
 
@@ -317,7 +372,9 @@ Vidu S1（arXiv:2607.03118）是一个实时交互式音→视频模型，其 §
 
 - **仅推理** —— 不训练（跳过 Stage 1–3）。
 - **音视频联合生成** —— TI2V 无音频输入；视频与音频按 chunk 同步逐段生成。
-- **完整保真的流式机制** —— 因果掩码 + 滑动窗口 + sink + TwinCache + KV cache + RoPE 重定位，**音视频皆然**。
+- **完整保真的流式机制** —— 因果掩码 + 滑动窗口 + 持久锚点 + TwinCache + KV cache + RoPE 重定位，**音视频皆然**。
+  第一个 chunk 用标准 **双向 ti2v bootstrap**（参考图替换 latent 帧 0、全注意力）生成，其
+  `[图 | chunk 1]` 输出成为后续因果窗口 `[anchor | history | current]` 永不淘汰的锚。
 - **五种流式策略**（M1 全量重算 + 三种 M2 KV cache 变体 + 一种 image-conditioning 基线）用于消融，
   可从 CLI 或 webui 下拉框按次生成选择。
 
@@ -429,7 +486,7 @@ uv run python -m ltx_pipelines.ti2vid_streaming \
 | 参数 | 默认值 | 含义 |
 |---|---|---|
 | `--stream-strategy` | `full_recompute` | `full_recompute` / `kv_twin` / `kv_clean` / `kv_noisy_steps` / `image_cond` 之一 |
-| `--window-chunks` | 4 | 滑动窗口滚动历史大小（以 AR chunk 计；TwinCache FIFO 上限；视频 sink + 首 chunk 为持久项，不计入） |
+| `--window-chunks` | 4 | 滑动窗口滚动历史大小（以 AR chunk 计；TwinCache FIFO 上限；持久项——视频锚 `[图 | chunk 1]`、音频首块——不计入） |
 | `--chunk-frames` | 1 | 每个 AR 步生成的 latent 视频帧数（1 = 最细粒度）；每步同时生成时间对齐的音频帧 |
 | `--causal-cross-attn` / `--no-causal-cross-attn` | 开 | 对 video↔audio 跨注意力施加时间因果掩码（默认开启，论文忠实；对双向基础模型是训练/测试不匹配） |
 | `--cross-attn-lookahead-seconds` | 0.0 | 因果跨注意力下视频帧可看到的未来音频秒数（0 = 严格因果） |
@@ -443,7 +500,11 @@ uv run python -m ltx_pipelines.ti2vid_streaming \
 
 - **M1 —— 正确但慢，无 core 改动**（`streaming.py::streaming_generate_joint`）：通过
   `Modality.attention_mask` 施加块因果掩码，**音视频皆**为 latent 级 TwinCache（每步注入历史快照，
-  sink+history 通过 `denoise_mask=0` 冻结，使 Euler 速度为 0）。音频用独立 `[history | current]` 窗口。
+  anchor+history 通过 `denoise_mask=0` 冻结，使 Euler 速度为 0）。chunk 1 是
+  **双向 ti2v bootstrap**（图替换帧 0、无因果掩码），其 `[图 | chunk 1]` 输出钉住为锚
+  （恒 clean、永不淘汰）；后续窗口为 `[anchor | history | current]`。
+  音频用独立 `[first | history | current]` 窗口——首块与视频窗对齐、钉住且恒为 clean
+  （Vidu S1 §2.3.1 的持久参考是第一个生成的 *video-audio* 状态）。
   CLI 默认 `full_recompute` 与 `image_cond` 策略属 M1 族。
 - **M2 —— KV cache + RoPE 重定位**（`streaming.py::streaming_generate_joint_cached` + `streaming_cache.py`
   + `streaming_model.py` + `attention.py`）：视频自注意力（`attn1`）**与**音频自注意力（`audio_attn1`）
@@ -451,13 +512,35 @@ uv run python -m ltx_pipelines.ti2vid_streaming \
   `kv_noisy_steps` 策略属 M2 族；`strategy=` 参数选择每个 cache 用哪种 TwinCache 变体。生产管线不受影响
   （`*.stream_cache` 保持 `None` → 与标准路径逐字节一致）。
 
+### 设计说明：为何用双向锚 bootstrap 而非论文的 sink
+
+Vidu S1 跑在自家 Vidu 基模上——从各方迹象看，那是图像 / 视频 / 音频 / 文本全自注意力 +
+MMRoPE 式位置编码的架构（与 MiniMax H3 同族）。在那样的模型里，§2.3.1 的 sink 是训练过的
+原生组件；而搬到 LTX-2 上会撞上具体的架构障碍：
+
+1. **LTX-2 里 sink 的 K/V 不平稳。** 视频 token 在每个 block 都与音频交叉注意力，钉住的
+   首帧 token 特征依赖当前音频切片——论文 "constructed once, remains fixed" 的缓存会冻结
+   陈旧的跨模态状态，而每步重算 sink 的 K/V（我们此前的做法）要为这一帧付出全价，且
+   checkpoint 从未按这种用法训练过。
+2. **基模是双向的。** 因果窗口里永久钉一帧参考，是发生在流中影响力最大位置上的训练/测试
+   错配——每个后续 chunk 都要 attend 的锚。
+
+因此 chunk 1 改用**标准 ti2v** 生成（参考图替换 latent 帧 0、全注意力——正是 LTX-2 的
+训练方式），其 `[图 | chunk 1]` 输出整体成为钉住的锚。论文持久参考的**内容**（首帧 +
+第一个生成的 video-audio 状态）完整保留在一个钉住的 chunk 里，无需再维护任何特殊 sink 机制。
+
+文本侧：Vidu S1 的接口是对话式的。如今最接近的同族模型——MiniMax H3，以及 JoyAI-Echo
+（jd-opensource，基于 LTX-2.3 的自回归视频模型）——驱动生成用的是格式化/结构化的提示词
+模式而非对话。LTX-2 的文本端（Gemma、自然语言提示）恰好是简单的自然语言风格，因此
+**交互式**描述在这里正好承担 Vidu S1 的对话式角色——见下文的 live-prompt Gradio 应用。
+
 ### 交互式流式（Gradio webui，实时改写提示词）
 
 `packages/ltx-pipelines/src/ltx_pipelines/app_gradio.py` 是同一套流式机制之上的 **交互式** 前端：
 一个长驻会话（DiT + Gemma + VAE 只构建一次）按 chunk 生成，并把不断增长的画面 + 实时音频
 **流式** 推送到浏览器。生成过程中编辑 **live prompt** 文本框，会改写 *下一个* chunk 的
 跨注意力条件 —— 于是画面内容会中途改变。这是安全的，因为文本只是跨注意力：它 **不属于**
-缓存的自注意力历史或 sink，所以改提示词 **不会** 重置画面、不会作废滑动窗口状态。
+缓存的自注意力历史或锚，所以改提示词 **不会** 重置画面、不会作废滑动窗口状态。
 
 “Generation settings” 面板里的 **Stream strategy** 下拉框提供同样的五个 `--stream-strategy` 选项 ——
 **按次生成可选，无需重启 app**（KV-cache wrapper 在每次 run 的 generator 内构建与 detach）。
@@ -472,7 +555,7 @@ uv run python -m ltx_pipelines.app_gradio \
     --stream-strategy kv_clean
 ```
 
-打开打印的 URL，上传参考图（sink），设好初始提示词，点 **Generate**，然后在流式过程中编辑
+打开打印的 URL，上传参考图（它成为锚的第 0 帧），设好初始提示词，点 **Generate**，然后在流式过程中编辑
 live prompt 即可。`--host/--port/--share` 控制服务；`--device` / `--text-encoder-device` 可把
 12B 文本编码器分到第二张 GPU。
 
@@ -502,13 +585,16 @@ uv run python packages/ltx-pipelines/tests/test_streaming_interactive.py   # 交
 ### 相对论文的不足
 
 1. **无训练（Stage 1–3）。** 双向权重被直接当作因果模型使用——最大的质量差距。
-2. **无 Stage-3 蒸馏。** 生成用完整步数（默认 30，蒸馏 checkpoint 用 15），而非 3 步。论文 42 FPS / 540p
+2. **chunk 1 双向 bootstrap。** 第一个 chunk 用全（非因果）注意力去噪，以匹配基础模型的训练、
+   让流有一个高质量 ti2v 锚；论文的因果模型是因果地生成它的。后续 chunk 与论文一致为因果。
+   （动机见上文"设计说明"。）
+3. **无 Stage-3 蒸馏。** 生成用完整步数（默认 30，蒸馏 checkpoint 用 15），而非 3 步。论文 42 FPS / 540p
    headline 在没有蒸馏 + §2.3.2 基础设施栈的情况下不可达。
-3. **无 §2.3.2 推理基础设施。** SageAttention / SpargeAttention / SLA、定制 W8A8 GEMM、kernel fusion、
+4. **无 §2.3.2 推理基础设施。** SageAttention / SpargeAttention / SLA、定制 W8A8 GEMM、kernel fusion、
    CUDA Graph、Ulysses 多卡并行均未实现。LTX-2 自带的 `fp8-cast` / `fp8-scaled-mm` 量化与 FlashAttention 仍可用。
-4. **AV 跨模态因果掩码默认开启** —— 对双向基础模型是训练/测试不匹配，但优先论文忠实的因果性
+5. **AV 跨模态因果掩码默认开启** —— 对双向基础模型是训练/测试不匹配，但优先论文忠实的因果性
    （`--no-causal-cross-attn` 可关闭）。
-5. **无 CFG。** `--negative-prompt` 被编码但未使用（单次前向）。
+6. **无 CFG。** `--negative-prompt` 被编码但未使用（单次前向）。
 
 ### 本 fork 新增 / 修改的文件
 
@@ -521,11 +607,12 @@ uv run python packages/ltx-pipelines/tests/test_streaming_interactive.py   # 交
   + 增量解码 + `stream_strategy` 分发。
 - `packages/ltx-pipelines/src/ltx_pipelines/app_gradio.py` —— Gradio webui（Stream strategy 下拉框）。
 - `packages/ltx-core/src/ltx_core/model/transformer/streaming_cache.py` ——
-  `StreamingKVCache`（twin / clean / noisy_steps 策略；视频 sink+持久 / 音频无 sink FIFO）。
+  `StreamingKVCache`（twin / clean / noisy_steps 策略；持久首块槽位——joint TI2V 的视频 cache
+  提交 `[图 | chunk 1]` 锚，音频钉住首块；两者皆无 sink，A2V 保留带 sink 的默认）。
 - `packages/ltx-core/src/ltx_core/model/transformer/streaming_model.py` ——
   `CausalStreamingModel`（视频 + 可选音频缓存；透传 strategy/step_idx）。
 - `packages/ltx-core/src/ltx_core/model/transformer/attention.py` —— `stream_cache` 属性 + `_stream_cached_forward`
-  （音频无 sink 布局；对策略无感）。
+  （音视频皆无 sink 布局；对策略无感）。
 - `packages/ltx-pipelines/tests/test_streaming_{joint,tiny_model,interactive}.py` ——
   纯张量 / 微型模型 / 交互测试，覆盖全部五种策略。
 

@@ -186,9 +186,11 @@ def main() -> None:
         )
         print(f"[phase3] resolver called {calls['n']} times for {expected} chunks")
 
-        # Phase A: single-chunk parity across all 5 strategies (no history =>
-        # every cached path's cache.read() returns None; image_cond chunk-0
-        # sink == M1 chunk-0 sink). All must agree bit-close with full_recompute.
+        # Phase A: single-chunk parity across the 4 streaming strategies (no
+        # history => every cached path's cache.read() returns None). They share
+        # the bidirectional ti2v bootstrap and must agree bit-close with
+        # full_recompute. image_cond keeps its all-causal rotating-sink path,
+        # so its single-chunk output legitimately differs — finite only.
         for ccx in (False, True):
             ctx_v = torch.randn(1, 4, 16)
             ctx_a = torch.randn(1, 4, 16)
@@ -216,7 +218,12 @@ def main() -> None:
                 ).abs().max().item()
                 print(f"[phaseA ccx={ccx}] {s:15s} vs full_recompute: "
                       f"video max|diff|={dv:.3e} audio max|diff|={da:.3e}")
-                assert dv < 1e-4 and da < 1e-4, f"single-chunk {s} must match full_recompute (ccx={ccx})"
+                if s == "image_cond":
+                    assert torch.isfinite(last.video_latent_prefix).all() and torch.isfinite(
+                        last.audio_latent_prefix
+                    ).all(), f"non-finite latents ({s})"
+                else:
+                    assert dv < 1e-4 and da < 1e-4, f"single-chunk {s} must match full_recompute (ccx={ccx})"
 
         # Phase B: multi-chunk (4 generated) finiteness for every strategy.
         for s in _INTERACTIVE_STRATEGIES:
