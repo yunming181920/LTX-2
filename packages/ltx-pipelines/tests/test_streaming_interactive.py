@@ -1,19 +1,21 @@
 """Checkpoint-free CPU validation of the interactive streaming driver.
 
 Mirrors ``test_streaming_tiny_model.py`` (same tiny random 2-layer model, no
-checkpoint) to exercise :func:`iter_streaming_chunks_joint` — the generator that
-adds the live-prompt ``context_resolver`` hook and per-chunk yielding on top of M1.
+checkpoint) to exercise the interactive streaming generators — the generators
+that add the live-prompt ``context_resolver`` hook and per-chunk yielding on top
+of the offline streaming drivers.
 
 Three phases:
 
   * **Phase 1 — constant-context parity.** A resolver returning the same context
-    every chunk must reproduce :func:`streaming_generate_joint` (M1) exactly (same
-    chunk loop body). The final yielded video prefix equals M1's full video latent;
-    the audio prefix matches M1's filled audio region.
+    every chunk must reproduce the offline cached driver
+    (:func:`streaming_generate_joint_cached`, same chunk loop body) exactly. The
+    final yielded video prefix equals the offline full video latent; the audio
+    prefix matches its filled audio region.
   * **Phase 2 — per-chunk swap smoke.** A resolver returning a *different* context
     on chunk ≥ 1 runs to completion with finite output, and chunk 0 (no history) is
-    unchanged — its prefix matches M1(ctx0) through chunk 0. This is the live-prompt-
-    injection guarantee: a context change affects only subsequent chunks.
+    unchanged — its prefix matches offline(ctx0) through chunk 0. This is the
+    live-prompt-injection guarantee: a context change affects only subsequent chunks.
   * **Phase 3 — resolver call count.** The resolver is invoked exactly once per AR
     chunk (one cross-attention context per chunk).
 
@@ -30,10 +32,9 @@ from ltx_core.components.patchifiers import AudioPatchifier, VideoLatentPatchifi
 from ltx_core.model.transformer.model import LTXModel, X0Model
 from ltx_core.tools import AudioLatentTools, VideoLatentTools
 from ltx_core.types import AudioLatentShape, VideoLatentShape
-from ltx_pipelines.utils.streaming import streaming_generate_joint
+from ltx_pipelines.utils.streaming import streaming_generate_joint_cached
 from ltx_pipelines.utils.streaming_interactive import (
     StreamChunk,
-    iter_streaming_chunks_joint,
     iter_streaming_chunks_joint_cached,
     iter_streaming_chunks_joint_image_cond,
 )
@@ -98,22 +99,21 @@ def _base_kwargs(x0: X0Model, num_latent_frames: int, seed: int = 0) -> dict:
     )
 
 
-def run_m1(x0: X0Model, num_latent_frames: int, v_context: torch.Tensor, a_context: torch.Tensor) -> tuple:
+def run_offline(x0: X0Model, num_latent_frames: int, v_context: torch.Tensor, a_context: torch.Tensor) -> tuple:
     kw = _base_kwargs(x0, num_latent_frames)
     kw["v_context"] = v_context
     kw["a_context"] = a_context
-    return streaming_generate_joint(**kw)
+    return streaming_generate_joint_cached(**kw, strategy="twin")
 
 
 def run_interactive(x0: X0Model, num_latent_frames: int, resolver) -> list[StreamChunk]:
     kw = _base_kwargs(x0, num_latent_frames)
     kw["context_resolver"] = resolver
-    return list(iter_streaming_chunks_joint(**kw))
+    return list(iter_streaming_chunks_joint_cached(**kw, strategy="twin"))
 
 
 # CLI strategy name -> (generator, cache-strategy-or-None)
 _INTERACTIVE_STRATEGIES = {
-    "full_recompute": (iter_streaming_chunks_joint, None),
     "kv_twin": (iter_streaming_chunks_joint_cached, "twin"),
     "kv_clean": (iter_streaming_chunks_joint_cached, "clean"),
     "kv_noisy_steps": (iter_streaming_chunks_joint_cached, "noisy_steps"),
@@ -127,8 +127,6 @@ def run_strategy(x0: X0Model, num_latent_frames: int, resolver, strategy: str) -
     fn, cache_strategy = _INTERACTIVE_STRATEGIES[strategy]
     if cache_strategy is not None:
         return list(fn(**kw, strategy=cache_strategy))
-    if fn is iter_streaming_chunks_joint:
-        return list(fn(**kw))  # window_chunks present
     kw.pop("window_chunks", None)  # image_cond has no window_chunks
     return list(fn(**kw))
 
@@ -136,22 +134,22 @@ def run_strategy(x0: X0Model, num_latent_frames: int, resolver, strategy: str) -
 def main() -> None:
     x0 = build_tiny()
     with torch.inference_mode():
-        # Phase 1: constant-context parity vs M1 (2 generated chunks).
+        # Phase 1: constant-context parity vs the offline cached driver (2 chunks).
         ctx_v = torch.randn(1, 4, 16)
         ctx_a = torch.randn(1, 4, 16)
-        m1_v, m1_a = run_m1(x0, 3, ctx_v, ctx_a)
+        off_v, off_a = run_offline(x0, 3, ctx_v, ctx_a)
         chunks = run_interactive(x0, 3, lambda i, n: (ctx_v, ctx_a))
         last = chunks[-1]
-        dv = (last.video_latent_prefix - m1_v).abs().max().item()
-        assert last.video_latent_prefix.shape == m1_v.shape, "video prefix shape must match M1"
-        assert dv == 0.0, f"constant-context video must equal M1 bitwise, max|diff|={dv}"
-        audio_len = min(last.audio_latent_prefix.shape[2], m1_a.shape[2])
-        da = (last.audio_latent_prefix[:, :, :audio_len] - m1_a[:, :, :audio_len]).abs().max().item()
-        assert da == 0.0, f"constant-context audio must equal M1 bitwise, max|diff|={da}"
+        dv = (last.video_latent_prefix - off_v).abs().max().item()
+        assert last.video_latent_prefix.shape == off_v.shape, "video prefix shape must match offline"
+        assert dv == 0.0, f"constant-context video must equal offline bitwise, max|diff|={dv}"
+        audio_len = min(last.audio_latent_prefix.shape[2], off_a.shape[2])
+        da = (last.audio_latent_prefix[:, :, :audio_len] - off_a[:, :, :audio_len]).abs().max().item()
+        assert da == 0.0, f"constant-context audio must equal offline bitwise, max|diff|={da}"
         print(f"[phase1] constant-context parity: video max|diff|={dv:.3e} audio max|diff|={da:.3e}")
 
         # Phase 2: per-chunk context swap (4 generated chunks). Chunk 0 must match
-        # M1(ctx0); later chunks use ctx1 and only need to be finite.
+        # offline(ctx0); later chunks use ctx1 and only need to be finite.
         ctx0_v, ctx0_a = torch.randn(1, 4, 16), torch.randn(1, 4, 16)
         ctx1_v, ctx1_a = torch.randn(1, 4, 16), torch.randn(1, 4, 16)
 
@@ -162,14 +160,14 @@ def main() -> None:
         last_swap = swap_chunks[-1]
         assert torch.isfinite(last_swap.video_latent_prefix).all(), "swap: non-finite video"
         assert torch.isfinite(last_swap.audio_latent_prefix).all(), "swap: non-finite audio"
-        # Chunk 0 (no history) is independent of later context → must equal M1(ctx0).
-        m1_v0, _ = run_m1(x0, 5, ctx0_v, ctx0_a)
+        # Chunk 0 (no history) is independent of later context → must equal offline(ctx0).
+        off_v0, _ = run_offline(x0, 5, ctx0_v, ctx0_a)
         first = swap_chunks[0]
-        d0 = (first.video_latent_prefix - m1_v0[:, :, : first.video_latent_prefix.shape[2]]).abs().max().item()
-        assert d0 == 0.0, f"chunk-0 must match M1(ctx0), max|diff|={d0}"
+        d0 = (first.video_latent_prefix - off_v0[:, :, : first.video_latent_prefix.shape[2]]).abs().max().item()
+        assert d0 == 0.0, f"chunk-0 must match offline(ctx0), max|diff|={d0}"
         print(
             f"[phase2] swap smoke: {len(swap_chunks)} chunks finite; "
-            f"chunk-0 matches M1(ctx0) (max|diff|={d0:.3e})"
+            f"chunk-0 matches offline(ctx0) (max|diff|={d0:.3e})"
         )
 
         # Phase 3: resolver is called exactly once per chunk.
@@ -186,18 +184,16 @@ def main() -> None:
         )
         print(f"[phase3] resolver called {calls['n']} times for {expected} chunks")
 
-        # Phase A: single-chunk parity across the 4 streaming strategies (no
-        # history => every cached path's cache.read() returns None). They share
-        # the bidirectional ti2v bootstrap and must agree bit-close with
-        # full_recompute. image_cond keeps its all-causal rotating-sink path,
-        # so its single-chunk output legitimately differs — finite only.
+        # Phase A: single-chunk parity across the 3 KV strategies (no history
+        # => every cached path's cache.read() returns None). They share the
+        # bidirectional ti2v bootstrap and must agree bit-close with kv_twin.
+        # image_cond keeps its all-causal rotating-sink path, so its
+        # single-chunk output legitimately differs — finite only.
         for ccx in (False, True):
             ctx_v = torch.randn(1, 4, 16)
             ctx_a = torch.randn(1, 4, 16)
-            ref = run_strategy(x0, 2, lambda i, n: (ctx_v, ctx_a), "full_recompute")[-1]
+            ref = run_strategy(x0, 2, lambda i, n: (ctx_v, ctx_a), "kv_twin")[-1]
             for s in _INTERACTIVE_STRATEGIES:
-                if s == "full_recompute":
-                    continue
                 # rebuild base kwargs with this ccx
                 kw = _base_kwargs(x0, 2)
                 kw["causal_cross_attn"] = ccx
@@ -205,8 +201,6 @@ def main() -> None:
                 fn, cs = _INTERACTIVE_STRATEGIES[s]
                 if cs is not None:
                     chunks = list(fn(**kw, strategy=cs))
-                elif fn is iter_streaming_chunks_joint:
-                    chunks = list(fn(**kw))
                 else:
                     kw.pop("window_chunks", None)
                     chunks = list(fn(**kw))
@@ -216,14 +210,14 @@ def main() -> None:
                 da = (
                     last.audio_latent_prefix[:, :, :alen] - ref.audio_latent_prefix[:, :, :alen]
                 ).abs().max().item()
-                print(f"[phaseA ccx={ccx}] {s:15s} vs full_recompute: "
+                print(f"[phaseA ccx={ccx}] {s:15s} vs kv_twin: "
                       f"video max|diff|={dv:.3e} audio max|diff|={da:.3e}")
                 if s == "image_cond":
                     assert torch.isfinite(last.video_latent_prefix).all() and torch.isfinite(
                         last.audio_latent_prefix
                     ).all(), f"non-finite latents ({s})"
                 else:
-                    assert dv < 1e-4 and da < 1e-4, f"single-chunk {s} must match full_recompute (ccx={ccx})"
+                    assert dv < 1e-4 and da < 1e-4, f"single-chunk {s} must match kv_twin (ccx={ccx})"
 
         # Phase B: multi-chunk (4 generated) finiteness for every strategy.
         for s in _INTERACTIVE_STRATEGIES:

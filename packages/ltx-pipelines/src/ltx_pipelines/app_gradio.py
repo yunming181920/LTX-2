@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 SESSION: InteractiveStreamingSession | None = None
 
 
-def _build_ui(session: InteractiveStreamingSession, default_strategy: str = "full_recompute") -> "Blocks":  # type: ignore[name-defined]
+def _build_ui(session: InteractiveStreamingSession, default_strategy: str = "kv_twin") -> "Blocks":  # type: ignore[name-defined]
     import gradio as gr
 
     def generate(  # noqa: PLR0913
@@ -108,22 +108,21 @@ def _build_ui(session: InteractiveStreamingSession, default_strategy: str = "ful
             with gr.Column(scale=1):
                 with gr.Accordion("Generation settings", open=False):
                     stream_strategy = gr.Dropdown(
-                        choices=["full_recompute", "kv_twin", "kv_clean", "kv_noisy_steps", "image_cond"],
+                        choices=["kv_twin", "kv_clean", "kv_noisy_steps", "image_cond"],
                         value=default_strategy,
                         label="Stream strategy",
                         info=(
-                            "full_recompute=M1 latent TwinCache; kv_twin=M2 KV cache (noisy mid + clean final); "
-                            "kv_clean(A)=M2 clean history; kv_noisy_steps(B)=M2 per-step noisy; "
-                            "image_cond(C)=no cache, per-chunk last-frame ref."
+                            "kv_twin=KV cache (noisy mid + clean final); kv_clean(A)=clean history; "
+                            "kv_noisy_steps(B)=per-step noisy; image_cond(C)=no cache, per-chunk last-frame ref."
                         ),
                     )
                     height = gr.Slider(256, 1024, value=512, step=32, label="Height")
                     width = gr.Slider(256, 1024, value=768, step=32, label="Width")
                     num_frames = gr.Slider(9, 257, value=33, step=8, label="Num frames")
-                    frame_rate = gr.Slider(8, 60, value=30, step=1, label="Frame rate (fps)")
+                    frame_rate = gr.Slider(8, 60, value=24, step=1, label="Frame rate (fps)")
                     steps = gr.Slider(1, 80, value=30, step=1, label="Inference steps")
-                    window_chunks = gr.Slider(1, 16, value=4, step=1, label="Window chunks")
-                    chunk_frames = gr.Slider(1, 8, value=1, step=1, label="Chunk frames")
+                    window_chunks = gr.Slider(1, 16, value=1, step=1, label="Window chunks")
+                    chunk_frames = gr.Slider(1, 64, value=3, step=1, label="Chunk frames (latent)")
                 video_out = gr.Video(label="Growing video", autoplay=True)
                 audio_out = gr.Audio(label="Live audio", streaming=True, autoplay=True)
                 status_out = gr.Markdown("Idle.")
@@ -179,12 +178,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--stream-strategy",
-        choices=["full_recompute", "kv_twin", "kv_clean", "kv_noisy_steps", "image_cond"],
-        default="full_recompute",
+        choices=["kv_twin", "kv_clean", "kv_noisy_steps", "image_cond"],
+        default="kv_twin",
         help="Default streaming strategy for the UI dropdown (changeable per generation in the UI). "
-        "full_recompute = M1 latent TwinCache; kv_twin = M2 KV cache (noisy mid + clean final); "
-        "kv_clean (A) = M2 clean history; kv_noisy_steps (B) = M2 per-step noise-matched history; "
-        "image_cond (C) = no cache, per-chunk last-frame image reference.",
+        "kv_twin = KV cache (noisy mid + clean final); kv_clean (A) = clean history; "
+        "kv_noisy_steps (B) = per-step noise-matched history; image_cond (C) = no cache, "
+        "per-chunk last-frame image reference.",
     )
     args = parser.parse_args()
 
