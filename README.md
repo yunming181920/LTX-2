@@ -56,9 +56,9 @@ now on the **LTX-2.5** split-pack checkpoints. Per the chosen scope:
   reference image replaces latent frame 0, full attention); its `[image |
   chunk 1]` output is the never-evicted anchor of every later causal window
   `[anchor | history | current]`.
-- **Five streaming strategies** (one M1 full-recompute + three M2 KV-cache
-  variants + one image-conditioning baseline) for ablation — selectable per
-  generation from the CLI or the webui dropdown.
+- **Four streaming strategies** (KV-cache TwinCache default + two history-read
+  ablations + one image-conditioning baseline) — selectable per generation from
+  the CLI or the webui dropdown.
 
 ### Download models from ModelScope
 
@@ -141,9 +141,9 @@ uv run python -m ltx_pipelines.ti2vid_streaming \
     --prompt "A person talking calmly to the camera." \
     --image ref.jpg 0 1.0 \
     --output-path out.mp4 \
-    --num-frames 33 --frame-rate 30 --height 512 --width 768 \
-    --num-inference-steps 15 --window-chunks 4 --chunk-frames 1 \
-    --stream-strategy full_recompute
+    --num-frames 33 --frame-rate 24 --height 512 --width 768 \
+    --num-inference-steps 15 --window-chunks 1 --chunk-frames 3 \
+    --stream-strategy kv_twin
 ```
 
 There is **no audio input** — audio is generated jointly with the video and written
@@ -154,17 +154,16 @@ into the output file. On low-VRAM GPUs add `--quantization fp8-cast --offload cp
 
 ### Streaming strategies (`--stream-strategy`)
 
-Five strategies, selectable per run (ablation):
+Four strategies, selectable per run (ablation):
 
 | Strategy | Description | Memory |
 |---|---|---|
-| `full_recompute` (default, M1) | Latent TwinCache; full per-step history recompute. The correct, recommended path. | baseline |
-| `kv_twin` (M2) | KV cache; history reads **noisy** at mid steps + **clean** at the final step (Vidu S1 §2.3.1). | M2 baseline |
-| `kv_clean` (ablation A) | KV cache; history reads **clean** at *every* step (pure-clean history). | ≈ M2 |
+| `kv_twin` (default) | KV cache + RoPE repositioning; history reads **noisy** at mid steps + **clean** at the final step (Vidu S1 §2.3.1). | baseline |
+| `kv_clean` (ablation A) | KV cache; history reads **clean** at *every* step (pure-clean history). | ≈ kv_twin |
 | `kv_noisy_steps` (ablation B) | KV cache; step *t* reads the history's own step-*t* **noisy** snapshot (noise-level matched). No clean, no sigma-0 forward. | ~`num_steps/2`× kv_twin ⚠️ |
-| `image_cond` (ablation C) | No KV cache; each chunk conditions on the **previous chunk's last frame** as the image reference (rotating sink), no attention history. | ≈ M1 |
+| `image_cond` (ablation C) | No KV cache; each chunk conditions on the **previous chunk's last frame** as the image reference (rotating sink), no attention history. | ≈ baseline |
 
-> `--use-kv-cache` is kept as a legacy alias for `--stream-strategy kv_twin`.
+> `--use-kv-cache` is kept as a legacy no-op (the KV-cache path is the default).
 >
 > **B (`kv_noisy_steps`) memory:** each history chunk stores `num_steps` noisy
 > K/V snapshots — about `num_steps/2`× the KV memory of `kv_twin`. Run B with a
@@ -174,9 +173,9 @@ Five strategies, selectable per run (ablation):
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--stream-strategy` | `full_recompute` | One of `full_recompute` / `kv_twin` / `kv_clean` / `kv_noisy_steps` / `image_cond` |
-| `--window-chunks` | 4 | Sliding-window rolling-history size in AR chunks (TwinCache FIFO cap; the persistent items — video anchor `[image | chunk 1]`, audio first chunk — are not counted) |
-| `--chunk-frames` | 1 | Latent video frames generated per AR step (1 = finest granularity); each step also generates time-aligned audio frames |
+| `--stream-strategy` | `kv_twin` | One of `kv_twin` / `kv_clean` / `kv_noisy_steps` / `image_cond` |
+| `--window-chunks` | 1 | Sliding-window rolling-history size in AR chunks (TwinCache FIFO cap; the persistent items — video anchor `[image | chunk 1]`, audio first chunk — are not counted) |
+| `--chunk-frames` | 3 | Latent video frames generated per AR step (1 image + 3 = 4 latents per window). The causal VAE decodes the window as 1 + frames×8 pixel frames: the first latent frame (the reference image) decodes to 1 frame, every later latent frame to 8, so a 3-latent chunk yields 1 + 3×8 = 25 pixel frames (≈ 1 s at 24 fps). Each step also generates time-aligned audio frames in lockstep |
 | `--causal-cross-attn` / `--no-causal-cross-attn` | on | Time-causal mask on video↔audio cross-attention (default ON, paper-faithful; train/test mismatch on the bidirectional base model) |
 | `--cross-attn-lookahead-seconds` | 0.0 | Seconds of future audio a video frame may attend under causal cross-attn (0 = strict causal) |
 
@@ -185,29 +184,20 @@ Standard LTX-2 flags (`--seed`, `--quantization`, `--offload`, `--compile`,
 `--num-frames`, `--frame-rate`, `--height`, `--width`, `--num-inference-steps`,
 `--diffvae-optimization`) behave as in the upstream 2.5 pipelines.
 
-### Two milestones (M1 / M2)
+### The streaming path (KV cache + RoPE repositioning)
 
-- **M1 — correct-but-slow, no core changes** (`streaming.py::streaming_generate_joint`):
-  block-causal mask through `Modality.attention_mask`, latent-level TwinCache for
-  *both* modalities (history snapshots injected per step; anchor+history frozen
-  via `denoise_mask=0` so the Euler velocity stays 0). Chunk 1 is a
-  **bidirectional ti2v bootstrap** — the image replaces latent frame 0, no
-  causal masks — and its `[image | chunk 1]` output is pinned as the anchor
-  (always clean, never evicted); later windows are `[anchor | history |
-  current]`. Audio gets its own `[first | history | current]` window — the
-  first chunk pinned and always clean, mirroring the video anchor (Vidu S1
-  §2.3.1's persistent reference is the first generated *video-audio* state).
-  The CLI default `full_recompute` and `image_cond` strategies are M1-family.
-- **M2 — KV cache + RoPE repositioning** (`streaming.py::streaming_generate_joint_cached`
-  + `streaming_cache.py` + `streaming_model.py` + `attention.py`): per-block KV
-  cache on **both** video self-attn (`attn1`) and audio self-attn (`audio_attn1`),
-  history K/V spliced from the cache, RoPE reapplied with the full-window
-  `window_pe`. The bidirectional bootstrap commits its `[image | chunk 1]` K/V
-  straight into the caches' permanent first slots (no separate sink block to
-  recompute each step). The `kv_twin` / `kv_clean` / `kv_noisy_steps` strategies
-  are M2-family; the `strategy=` arg selects which TwinCache variant each cache
-  uses. Production pipelines are untouched (`*.stream_cache` stays `None` →
-  byte-identical standard path).
+`streaming.py::streaming_generate_joint_cached` + `streaming_cache.py` +
+`streaming_model.py` + `attention.py`: per-block KV cache on **both** video
+self-attn (`attn1`) and audio self-attn (`audio_attn1`), history K/V spliced
+from the cache, RoPE reapplied with the full-window `window_pe`. Chunk 1 is a
+**bidirectional ti2v bootstrap** — the image replaces latent frame 0, no
+causal masks — and its `[image | chunk 1]` K/V is committed straight into the
+caches' permanent first slots (the never-evicted anchor; no separate sink
+block to recompute each step). Later windows are `[anchor | history | current]`
+(video) / `[first | history | current]` (audio) with block-causal query masks.
+The `strategy=` arg selects which TwinCache variant each cache uses
+(`kv_twin` / `kv_clean` / `kv_noisy_steps`). Production pipelines are untouched
+(`*.stream_cache` stays `None` → byte-identical standard path).
 
 ### Design note: why a bidirectional anchor bootstrap (not the paper's sink)
 
@@ -254,7 +244,7 @@ cached self-attention history or the anchor, so a prompt change does **not** res
 video or invalidate the sliding-window state.
 
 The **Stream strategy** dropdown in the “Generation settings” panel exposes the same
-five `--stream-strategy` options — selectable **per generation, without restarting
+four `--stream-strategy` options — selectable **per generation, without restarting
 the app** (the KV-cache wrapper is built and detached inside the generator each run).
 This makes A/B ablation between strategies convenient in one session. `--stream-strategy`
 on the CLI sets the dropdown’s default.
@@ -287,21 +277,22 @@ Notes:
 
 ### Tests
 
-Checkpoint-free CPU tests cover the streaming plumbing and all five strategies:
+Checkpoint-free CPU tests cover the streaming plumbing and all four strategies:
 
 ```bash
 uv run python packages/ltx-pipelines/tests/test_streaming_joint.py          # pure-tensor helpers
-uv run python packages/ltx-pipelines/tests/test_streaming_tiny_model.py     # tiny model: 5-strategy parity + finiteness
-uv run python packages/ltx-pipelines/tests/test_streaming_interactive.py   # interactive: 5-strategy parity + finiteness
+uv run python packages/ltx-pipelines/tests/test_streaming_tiny_model.py     # tiny model: 4-strategy parity + finiteness
+uv run python packages/ltx-pipelines/tests/test_streaming_interactive.py   # interactive: 4-strategy parity + finiteness
 ```
 
-`test_streaming_tiny_model.py` asserts single-chunk parity across the four
-streaming strategies (no history ⇒ identical; they share the bidirectional
-bootstrap) with `image_cond` checked for finiteness (its all-causal
-rotating-sink path legitimately differs on chunk 1), plus multi-chunk
-finiteness; `test_streaming_interactive.py`
-does the same for the Gradio/interactive driver (plus the live-prompt swap guarantee
-and resolver call-count). Run on a GPU before trusting M2 in production.
+`test_streaming_tiny_model.py` asserts single-chunk parity across the three KV
+strategies (no history ⇒ identical; they share the bidirectional bootstrap)
+with `image_cond` checked for finiteness (its all-causal rotating-sink path
+legitimately differs on chunk 1), plus multi-chunk finiteness;
+`test_streaming_interactive.py` does the same for the Gradio/interactive
+driver, plus constant-context parity against the offline driver, the
+live-prompt swap guarantee and the resolver call-count. Smoke-test at
+checkpoint scale before trusting quality in production.
 
 ### Known limitations vs. the paper
 
@@ -326,9 +317,9 @@ and resolver call-count). Run on a GPU before trusting M2 in production.
 
 ### Files added / changed by this fork
 
-- `packages/ltx-pipelines/src/ltx_pipelines/utils/streaming.py` — M1 + M2 joint
-  streaming drivers (incl. `streaming_generate_joint_image_cond` for ablation C) +
-  shared causal-streaming primitives.
+- `packages/ltx-pipelines/src/ltx_pipelines/utils/streaming.py` — the KV-cache
+  joint streaming driver (incl. `streaming_generate_joint_image_cond` for
+  ablation C) + shared causal-streaming primitives.
 - `packages/ltx-pipelines/src/ltx_pipelines/utils/streaming_interactive.py` —
   interactive generator drivers (`iter_streaming_chunks_joint` /
   `_cached` / `_image_cond`) with per-chunk context resolver + yielding.
@@ -348,7 +339,7 @@ and resolver call-count). Run on a GPU before trusting M2 in production.
 - `packages/ltx-core/src/ltx_core/model/transformer/attention.py` — `stream_cache`
   attr + `_stream_cached_forward` (sink-less layouts for both modalities; strategy-agnostic).
 - `packages/ltx-pipelines/tests/test_streaming_{joint,tiny_model,interactive}.py` —
-  pure-tensor / tiny-model / interactive tests covering all five strategies.
+  pure-tensor / tiny-model / interactive tests covering all four strategies.
 
 ### Upstream LTX-2
 
@@ -375,7 +366,7 @@ Vidu S1（arXiv:2607.03118）是一个实时交互式音→视频模型，其 §
 - **完整保真的流式机制** —— 因果掩码 + 滑动窗口 + 持久锚点 + TwinCache + KV cache + RoPE 重定位，**音视频皆然**。
   第一个 chunk 用标准 **双向 ti2v bootstrap**（参考图替换 latent 帧 0、全注意力）生成，其
   `[图 | chunk 1]` 输出成为后续因果窗口 `[anchor | history | current]` 永不淘汰的锚。
-- **五种流式策略**（M1 全量重算 + 三种 M2 KV cache 变体 + 一种 image-conditioning 基线）用于消融，
+- **四种流式策略**（三种 KV cache 变体 + 一种 image-conditioning 基线）用于消融，
   可从 CLI 或 webui 下拉框按次生成选择。
 
 ### 从 ModelScope 下载模型
@@ -456,9 +447,9 @@ uv run python -m ltx_pipelines.ti2vid_streaming \
     --prompt "一个人平静地对着镜头说话。" \
     --image ref.jpg 0 1.0 \
     --output-path out.mp4 \
-    --num-frames 33 --frame-rate 30 --height 512 --width 768 \
-    --num-inference-steps 15 --window-chunks 4 --chunk-frames 1 \
-    --stream-strategy full_recompute
+    --num-frames 33 --frame-rate 24 --height 512 --width 768 \
+    --num-inference-steps 15 --window-chunks 1 --chunk-frames 3 \
+    --stream-strategy kv_twin
 ```
 
 **无需音频输入** —— 音频与视频联合生成并写入输出文件。显存不足时加 `--quantization fp8-cast --offload cpu`。
@@ -467,15 +458,14 @@ uv run python -m ltx_pipelines.ti2vid_streaming \
 
 ### 流式策略（`--stream-strategy`）
 
-五种策略，可按次运行选择（消融）：
+四种策略，可按次运行选择（消融）：
 
 | 策略 | 说明 | 显存 |
 |---|---|---|
-| `full_recompute`（默认，M1） | latent TwinCache；每步全量重算 history。正确、推荐路径。 | 基准 |
-| `kv_twin`（M2） | KV cache；中间步读 **noisy**、末步读 **clean**（Vidu S1 §2.3.1）。 | M2 基准 |
+| `kv_twin`（默认，M2） | KV cache；中间步读 **noisy**、末步读 **clean**（Vidu S1 §2.3.1）。 | M2 基准 |
 | `kv_clean`（消融 A） | KV cache；所有步读 **clean**（纯干净 history）。 | ≈ M2 |
 | `kv_noisy_steps`（消融 B） | KV cache；步 t 读 history 自身步 t 的 **noisy**（噪声级别匹配）。无 clean、无 sigma-0 额外前向。 | ~`num_steps/2`× kv_twin ⚠️ |
-| `image_cond`（消融 C） | 无 KV cache；每块用**上一块末帧**做 image 参考（旋转 sink），无注意力 history。 | ≈ M1 |
+| `image_cond`（消融 C） | 无 KV cache；每块用**上一块末帧**做 image 参考（旋转 sink），无注意力 history。 | ≈ 基准 |
 
 > `--use-kv-cache` 保留为 `--stream-strategy kv_twin` 的旧别名。
 >
@@ -485,9 +475,9 @@ uv run python -m ltx_pipelines.ti2vid_streaming \
 
 | 参数 | 默认值 | 含义 |
 |---|---|---|
-| `--stream-strategy` | `full_recompute` | `full_recompute` / `kv_twin` / `kv_clean` / `kv_noisy_steps` / `image_cond` 之一 |
-| `--window-chunks` | 4 | 滑动窗口滚动历史大小（以 AR chunk 计；TwinCache FIFO 上限；持久项——视频锚 `[图 | chunk 1]`、音频首块——不计入） |
-| `--chunk-frames` | 1 | 每个 AR 步生成的 latent 视频帧数（1 = 最细粒度）；每步同时生成时间对齐的音频帧 |
+| `--stream-strategy` | `kv_twin` | `kv_twin` / `kv_clean` / `kv_noisy_steps` / `image_cond` 之一 |
+| `--window-chunks` | 1 | 滑动窗口滚动历史大小（以 AR chunk 计；TwinCache FIFO 上限；持久项——视频锚 `[图 | chunk 1]`、音频首块——不计入） |
+| `--chunk-frames` | 3 | 每个 AR 步生成的 latent 视频帧数（1 图 + 3 = 每窗口 4 个 latent）。因果 VAE 解码窗口为 1 + 帧数×8 个像素帧：第 1 个 latent 帧（参考图像）解码为 1 帧，之后每个 latent 帧解码为 8 帧，因此 3 个 latent 的 chunk 对应 1 + 3×8 = 25 个像素帧（24 fps 下约 1 秒）。每步同时生成时间对齐的音频帧 |
 | `--causal-cross-attn` / `--no-causal-cross-attn` | 开 | 对 video↔audio 跨注意力施加时间因果掩码（默认开启，论文忠实；对双向基础模型是训练/测试不匹配） |
 | `--cross-attn-lookahead-seconds` | 0.0 | 因果跨注意力下视频帧可看到的未来音频秒数（0 = 严格因果） |
 
@@ -496,21 +486,13 @@ uv run python -m ltx_pipelines.ti2vid_streaming \
 `--num-frames`、`--frame-rate`、`--height`、`--width`、`--num-inference-steps`、
 `--diffvae-optimization`）与上游 2.5 管线一致。
 
-### 两个里程碑（M1 / M2）
+### 流式路径（KV cache + RoPE 重定位）
 
-- **M1 —— 正确但慢，无 core 改动**（`streaming.py::streaming_generate_joint`）：通过
-  `Modality.attention_mask` 施加块因果掩码，**音视频皆**为 latent 级 TwinCache（每步注入历史快照，
-  anchor+history 通过 `denoise_mask=0` 冻结，使 Euler 速度为 0）。chunk 1 是
-  **双向 ti2v bootstrap**（图替换帧 0、无因果掩码），其 `[图 | chunk 1]` 输出钉住为锚
-  （恒 clean、永不淘汰）；后续窗口为 `[anchor | history | current]`。
-  音频用独立 `[first | history | current]` 窗口——首块与视频窗对齐、钉住且恒为 clean
-  （Vidu S1 §2.3.1 的持久参考是第一个生成的 *video-audio* 状态）。
-  CLI 默认 `full_recompute` 与 `image_cond` 策略属 M1 族。
-- **M2 —— KV cache + RoPE 重定位**（`streaming.py::streaming_generate_joint_cached` + `streaming_cache.py`
-  + `streaming_model.py` + `attention.py`）：视频自注意力（`attn1`）**与**音频自注意力（`audio_attn1`）
-  各一个 KV cache，历史 K/V 从缓存拼接，用全窗 `window_pe` 重新施加 RoPE。`kv_twin` / `kv_clean` /
-  `kv_noisy_steps` 策略属 M2 族；`strategy=` 参数选择每个 cache 用哪种 TwinCache 变体。生产管线不受影响
-  （`*.stream_cache` 保持 `None` → 与标准路径逐字节一致）。
+KV cache + RoPE 重定位（`streaming.py::streaming_generate_joint_cached` + `streaming_cache.py`
++ `streaming_model.py` + `attention.py`）：视频自注意力（`attn1`）**与**音频自注意力（`audio_attn1`）
+各一个 KV cache，历史 K/V 从缓存拼接，用全窗 `window_pe` 重新施加 RoPE。`kv_twin` / `kv_clean` /
+`kv_noisy_steps` 策略属 M2 族；`strategy=` 参数选择每个 cache 用哪种 TwinCache 变体。生产管线不受影响
+（`*.stream_cache` 保持 `None` → 与标准路径逐字节一致）。
 
 ### 设计说明：为何用双向锚 bootstrap 而非论文的 sink
 
@@ -542,7 +524,7 @@ MMRoPE 式位置编码的架构（与 MiniMax H3 同族）。在那样的模型�
 跨注意力条件 —— 于是画面内容会中途改变。这是安全的，因为文本只是跨注意力：它 **不属于**
 缓存的自注意力历史或锚，所以改提示词 **不会** 重置画面、不会作废滑动窗口状态。
 
-“Generation settings” 面板里的 **Stream strategy** 下拉框提供同样的五个 `--stream-strategy` 选项 ——
+“Generation settings” 面板里的 **Stream strategy** 下拉框提供同样的四个 `--stream-strategy` 选项 ——
 **按次生成可选，无需重启 app**（KV-cache wrapper 在每次 run 的 generator 内构建与 detach）。
 便于在一个 session 里做策略间消融对比。CLI 上的 `--stream-strategy` 设下拉框默认值。
 
@@ -570,15 +552,15 @@ live prompt 即可。`--host/--port/--share` 控制服务；`--device` / `--text
 
 ### 测试
 
-无需 checkpoint 的 CPU 测试覆盖流式管线与全部五种策略：
+无需 checkpoint 的 CPU 测试覆盖流式管线与全部四种策略：
 
 ```bash
 uv run python packages/ltx-pipelines/tests/test_streaming_joint.py          # 纯张量 helper
-uv run python packages/ltx-pipelines/tests/test_streaming_tiny_model.py     # 微型模型：5 策略 parity + finiteness
-uv run python packages/ltx-pipelines/tests/test_streaming_interactive.py   # 交互：5 策略 parity + finiteness
+uv run python packages/ltx-pipelines/tests/test_streaming_tiny_model.py     # 微型模型：4 策略 parity + finiteness
+uv run python packages/ltx-pipelines/tests/test_streaming_interactive.py   # 交互：4 策略 parity + finiteness
 ```
 
-`test_streaming_tiny_model.py` 断言五种策略单 chunk 逐位一致（无 history ⇒ 等价）+ 多 chunk finiteness；
+`test_streaming_tiny_model.py` 断言四种策略单 chunk 逐位一致（无 history ⇒ 等价）+ 多 chunk finiteness；
 `test_streaming_interactive.py` 对交互/Gradio 驱动做同样校验（外加 live-prompt 改写保证与 resolver 调用次数）。
 生产环境信任 M2 前请在 GPU 上跑一遍。
 
@@ -598,10 +580,10 @@ uv run python packages/ltx-pipelines/tests/test_streaming_interactive.py   # 交
 
 ### 本 fork 新增 / 修改的文件
 
-- `packages/ltx-pipelines/src/ltx_pipelines/utils/streaming.py` —— M1 + M2 联合流式驱动
-  （含消融 C 的 `streaming_generate_joint_image_cond`）+ 共享因果流式原语。
+- `packages/ltx-pipelines/src/ltx_pipelines/utils/streaming.py` —— KV cache + image_cond 联合流式驱动
+  （`streaming_generate_joint_cached` / `streaming_generate_joint_image_cond`）+ 共享因果流式原语。
 - `packages/ltx-pipelines/src/ltx_pipelines/utils/streaming_interactive.py` ——
-  交互生成器驱动（`iter_streaming_chunks_joint` / `_cached` / `_image_cond`，带逐 chunk context resolver + yield）。
+  交互生成器驱动（`iter_streaming_chunks_joint_cached` / `_image_cond`，带逐 chunk context resolver + yield）。
 - `packages/ltx-pipelines/src/ltx_pipelines/ti2vid_streaming.py` —— `TI2VidStreamingPipeline` + CLI（`--stream-strategy`）。
 - `packages/ltx-pipelines/src/ltx_pipelines/interactive_session.py` —— 长驻会话 + `LivePromptEncoder`
   + 增量解码 + `stream_strategy` 分发。
@@ -614,7 +596,7 @@ uv run python packages/ltx-pipelines/tests/test_streaming_interactive.py   # 交
 - `packages/ltx-core/src/ltx_core/model/transformer/attention.py` —— `stream_cache` 属性 + `_stream_cached_forward`
   （音视频皆无 sink 布局；对策略无感）。
 - `packages/ltx-pipelines/tests/test_streaming_{joint,tiny_model,interactive}.py` ——
-  纯张量 / 微型模型 / 交互测试，覆盖全部五种策略。
+  纯张量 / 微型模型 / 交互测试，覆盖全部四种策略。
 
 ### 上游 LTX-2
 

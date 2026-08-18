@@ -22,14 +22,12 @@ first generated video-audio reference), so per-step activation memory is
 O(window) for both modalities. The full latents are decoded once at the end
 (causal-VAE seamless video decode + audio decode) and returned.
 
-Two paths:
-  * **M1** (default): latent TwinCache, full per-step recompute of history
-    features — the correct, recommended path.
-  * **M2** (``--use-kv-cache``): per-block KV cache + RoPE repositioning for
-    *both* video and audio self-attention. Faster, but conceptual/unvalidated
-    (extends an already-untested A2V M2 path to a second modality with a
-    sink-less layout) — run ``tests/test_streaming_joint_parity.py`` in a GPU
-    env before trusting.
+The driver is the KV-cache path (``kv_twin`` by default): per-block KV cache +
+RoPE repositioning for *both* video and audio self-attention. Faster than the
+removed latent-recompute path; conceptual/unvalidated on real weights (a
+training-free reproduction on a bidirectional checkpoint) — smoke-test at
+checkpoint scale before trusting quality. Ablations: ``kv_clean`` /
+``kv_noisy_steps`` (history-read variants) and ``image_cond`` (no cache).
 
 No core (ltx-core) production changes; reuses ``DiffusionStage``'s transformer
 context for the transformer lifecycle, ``PromptEncoder``/``ImageConditioner`` for IO,
@@ -76,7 +74,6 @@ from ltx_pipelines.utils.helpers import (
 )
 from ltx_pipelines.utils.model_paths import ModelPaths
 from ltx_pipelines.utils.media_io import encode_video, load_image_and_preprocess
-from ltx_pipelines.utils.streaming import streaming_generate_joint
 from ltx_pipelines.utils.types import OffloadMode
 
 logger = logging.getLogger(__name__)
@@ -88,7 +85,7 @@ class TI2VidStreamingPipeline:
     The pretrained LTX-2 (full, non-distilled) checkpoint is used as the causal
     model. Video and audio are generated chunk-by-chunk in lockstep, each with a
     sliding window + TwinCache history (see
-    :func:`ltx_pipelines.utils.streaming.streaming_generate_joint`).
+    :func:`ltx_pipelines.utils.streaming.streaming_generate_joint_cached`).
     """
 
     def __init__(
@@ -165,10 +162,10 @@ class TI2VidStreamingPipeline:
         frame_rate: float,
         num_inference_steps: int,
         images: list[ImageConditioningInput],
-        window_chunks: int = 4,
-        chunk_frames: int = 1,
+        window_chunks: int = 1,
+        chunk_frames: int = 3,
         use_kv_cache: bool = False,
-        stream_strategy: str = "full_recompute",
+        stream_strategy: str = "kv_twin",
         causal_cross_attn: bool = True,
         cross_attn_lookahead_sec: float = 0.0,
         tiling_config: TilingConfig | None = None,
@@ -193,7 +190,7 @@ class TI2VidStreamingPipeline:
         noiser = GaussianNoiser(generator=generator)
         dtype = self.dtype
 
-        # Text context (negative unused — no CFG in M1, SimpleDenoiser logic).
+        # Text context (negative unused — no CFG in the streaming path).
         ctx_p, _ = self.prompt_encoder(
             [prompt, negative_prompt],
             enhance_first_prompt=enhance_prompt,
@@ -292,25 +289,8 @@ class TI2VidStreamingPipeline:
                     causal_cross_attn=causal_cross_attn,
                     cross_attn_lookahead_sec=cross_attn_lookahead_sec,
                 )
-            else:  # full_recompute (M1)
-                full_video_latent, full_audio_latent = streaming_generate_joint(
-                    sigmas=sigmas,
-                    num_generated_latent_frames=num_generated_latent_frames,
-                    chunk_frames=chunk_frames,
-                    window_chunks=window_chunks,
-                    video_tools_full=video_tools_full,
-                    audio_tools_full=audio_tools_full,
-                    sink_latent_unpatchified=sink_latent,
-                    v_context=v_context_p,
-                    a_context=a_context_p,
-                    stepper=stepper,
-                    transformer=transformer,
-                    noiser=noiser,
-                    dtype=dtype,
-                    device=self.device,
-                    causal_cross_attn=causal_cross_attn,
-                    cross_attn_lookahead_sec=cross_attn_lookahead_sec,
-                )
+            else:
+                raise ValueError(f"unknown stream strategy {stream_strategy!r}")
 
         decoded_video = self.video_decoder(full_video_latent, resolved_tiling, generator=generator)
         decoded_audio = self.audio_decoder(full_audio_latent)
@@ -325,38 +305,42 @@ def main() -> None:
     parser.add_argument(
         "--window-chunks",
         type=int,
-        default=4,
-        help="Sliding-window rolling-history size in AR chunks (TwinCache FIFO cap; "
-        "the video sink and the first generated video chunk are persistent and not "
-        "counted). Audio uses the same cap for its own FIFO history. Default 4.",
+        default=1,
+        help="Sliding-window rolling-history size in AR chunks (TwinCache FIFO cap; the "
+        "persistent items — the [image | chunk 1] anchor and the audio first chunk — are "
+        "not counted). Audio uses the same cap for its own FIFO history. Default 1.",
     )
     parser.add_argument(
         "--chunk-frames",
         type=int,
-        default=1,
-        help="Latent video frames generated per AR step (default 1 = finest streaming "
-        "granularity). The time-aligned audio latent frames for each chunk are generated "
-        "in lockstep (~8/fps*25 audio frames per video latent frame).",
+        default=3,
+        help="Latent video frames generated per AR step (default 3 = ~1 s of video at "
+        "24 fps). With the causal VAE the window decodes as 1 + frames*8 pixel frames: "
+        "the first latent frame (the reference image) decodes to 1 frame and every "
+        "later latent frame to 8, so a 3-latent chunk (1 image + 3 = 4 latents in the "
+        "window) yields 1 + 3*8 = 25 pixel frames (~1.04 s at 24 fps). The "
+        "time-aligned audio latent frames for each chunk are generated in lockstep "
+        "(~8/fps*25 audio frames per video latent frame).",
     )
     parser.add_argument(
         "--use-kv-cache",
         action="store_true",
-        help="Legacy alias for --stream-strategy kv_twin (the current M2 TwinCache path). "
+        help="Legacy no-op alias (the KV-cache TwinCache path is now the default). "
         "Ignored if --stream-strategy is given explicitly.",
     )
     parser.add_argument(
         "--stream-strategy",
-        choices=["full_recompute", "kv_twin", "kv_clean", "kv_noisy_steps", "image_cond"],
+        choices=["kv_twin", "kv_clean", "kv_noisy_steps", "image_cond"],
         default=None,
-        help="Streaming context strategy (ablation). full_recompute (default) = M1 latent "
-        "TwinCache, full per-step history recompute. kv_twin = M2 KV cache, history reads "
-        "noisy at mid steps + clean at the final step (Vidu S1 §2.3.1). kv_clean (ablation A) "
-        "= M2 KV cache reading clean history at every step. kv_noisy_steps (ablation B) = M2 "
-        "KV cache reading, at step t, the history's own step-t noisy snapshot (noise-level "
-        "matched; no clean, no sigma-0 forward; ~num_steps/2x the KV memory of kv_twin — "
-        "reduce --num-inference-steps / --window-chunks or add --offload). image_cond "
-        "(ablation C) = no KV cache; each chunk conditions on the previous chunk's last "
-        "frame as the image reference (rotating sink), no attention history.",
+        help="Streaming context strategy (ablation). kv_twin (default) = per-block KV "
+        "cache + RoPE repositioning, history reads noisy at mid steps + clean at the "
+        "final step (Vidu S1 §2.3.1). kv_clean (ablation A) = KV cache reading clean "
+        "history at every step. kv_noisy_steps (ablation B) = KV cache reading, at step "
+        "t, the history's own step-t noisy snapshot (noise-level matched; no clean, no "
+        "sigma-0 forward; ~num_steps/2x the KV memory of kv_twin — reduce "
+        "--num-inference-steps / --window-chunks or add --offload). image_cond (ablation "
+        "C) = no KV cache; each chunk conditions on the previous chunk's last frame as "
+        "the image reference (rotating sink), no attention history.",
     )
     parser.add_argument(
         "--causal-cross-attn",
@@ -377,14 +361,9 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # Resolve the streaming strategy. --stream-strategy (explicit) wins; otherwise
-    # --use-kv-cache maps to kv_twin; otherwise the M1 full-recompute default.
-    if args.stream_strategy is not None:
-        stream_strategy = args.stream_strategy
-    elif args.use_kv_cache:
-        stream_strategy = "kv_twin"
-    else:
-        stream_strategy = "full_recompute"
+    # Resolve the streaming strategy: --stream-strategy (explicit) wins,
+    # otherwise the KV-cache TwinCache default.
+    stream_strategy = args.stream_strategy or "kv_twin"
 
     pipeline = TI2VidStreamingPipeline(
         model_paths=args.model_paths,

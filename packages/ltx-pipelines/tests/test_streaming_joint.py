@@ -246,9 +246,10 @@ def test_block_causal_mask_matches_dense_bias() -> None:
     """BlockCausalMask.apply (unmasked prefix decomposition, the FlashAttention-
     compatible path) must reproduce dense additive-bias masked SDPA exactly.
 
-    Covers the three streaming layouts: M1 square (q == k, full window), M2
-    video (queries = [sink | current] over full-window keys, history query rows
-    removed), and M2 audio (queries = [current], 1 token per frame)."""
+    Covers the streaming layouts: full-window square (q == k — the causal
+    image_cond windows), joint cached video (queries = current rows over
+    full-window keys, history query rows removed), and joint cached audio
+    (queries = [current], 1 token per frame)."""
     torch.manual_seed(3)
     heads, dim_head, tpf = 2, 8, 4  # tokens per (video) frame
     attn = PytorchAttention()
@@ -258,16 +259,16 @@ def test_block_causal_mask_matches_dense_bias() -> None:
         return attn(q, k, v, heads, mask=bias)
 
     cases = []
-    # M1 square: window of 5 frames, q == k.
+    # Full-window square: 5 frames, q == k (image_cond windows).
     frames = torch.arange(5).repeat_interleave(tpf)
-    cases.append(("m1-square", frames, frames))
-    # M2 video: q = [sink (frame 0) | current (frames 3, 4)], k = full window.
+    cases.append(("square", frames, frames))
+    # Cached video: q = current rows (frames 3, 4) of the full-window keys.
     k_frames = torch.arange(5).repeat_interleave(tpf)
     q_frames = torch.cat([torch.zeros(tpf, dtype=torch.long), k_frames[3 * tpf :]])
-    cases.append(("m2-video", q_frames, k_frames))
-    # M2 audio: 1 token/frame, q = current rows only.
+    cases.append(("cached-video", q_frames, k_frames))
+    # Cached audio: 1 token/frame, q = current rows only.
     ak = torch.arange(7)
-    cases.append(("m2-audio", ak[4:], ak))
+    cases.append(("cached-audio", ak[4:], ak))
 
     for name, qf, kf in cases:
         mask = block_causal_attention_mask(qf, kf)

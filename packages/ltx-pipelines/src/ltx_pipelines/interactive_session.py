@@ -16,7 +16,7 @@ Two responsibilities on top of the model lifecycle:
     Gemma (:class:`LivePromptEncoder`, which caches the last prompt so an unchanged
     prompt is not re-encoded).
   * **Streaming output**. :meth:`InteractiveStreamingSession.run` is a generator
-    that drives :func:`iter_streaming_chunks_joint` and, after each AR chunk,
+    that drives the interactive streaming generators and, after each AR chunk,
     decodes the growing latent **prefix** through the kept-alive VAEs and re-encodes
     the assembled clip so far to a temp mp4 — yielding ``(video_path, audio_chunk,
     status)`` so a UI can show a growing video, stream live audio, and report
@@ -27,8 +27,6 @@ Design notes / trade-offs (see the plan for detail):
   * **Growing-prefix decode** (O(n²) VAE): the full filled latent prefix is decoded
     each chunk so the result is seamless (``decode_video`` does temporal tiling with
     overlap internally). Decoding only the new frame is a future optimization.
-  * **M1 path only** (the recommended, correct path). An M2 interactive variant can
-    reuse this decode/prompt layer later.
   * **Single active generation**: one prompt slot, one GPU — not a multi-tenant
     server. The queue holds at most one pending prompt (the latest wins).
 """
@@ -78,7 +76,6 @@ from ltx_pipelines.utils.media_io import encode_video, load_image_and_preprocess
 from ltx_pipelines.utils.model_paths import ModelPaths
 from ltx_pipelines.utils.streaming_interactive import (
     StreamChunk,
-    iter_streaming_chunks_joint,
     iter_streaming_chunks_joint_cached,
     iter_streaming_chunks_joint_image_cond,
 )
@@ -158,7 +155,7 @@ class LivePromptEncoder:
     def encode(self, prompt: str, *, enhance: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
         """Encode a single positive prompt → ``(v_context, a_context)``.
 
-        No CFG in the streaming M1 path (negative prompt unused), so only the
+        No CFG in the streaming path (negative prompt unused), so only the
         positive prompt is encoded. ``enhance`` rewrites the prompt via Gemma
         (``generate_enhanced_prompt``) before encoding. Context tensors are moved
         to ``target_device`` (the DiT device) so they can feed a cross-GPU pipeline.
@@ -373,14 +370,14 @@ class InteractiveStreamingSession:
         num_inference_steps: int,
         image_path: str,
         image_crf: int = 15,
-        window_chunks: int = 4,
-        chunk_frames: int = 1,
+        window_chunks: int = 1,
+        chunk_frames: int = 3,
         enhance_prompt: bool = False,
         causal_cross_attn: bool = True,
         cross_attn_lookahead_sec: float = 0.0,
         tiling_config: TilingConfig | None = None,
         output_dir: str | None = None,
-        stream_strategy: str = "full_recompute",
+        stream_strategy: str = "kv_twin",
     ) -> Generator[StreamUpdate, None, None]:
         """Generate with live prompt injection, yielding a growing clip + streaming audio.
 
@@ -500,24 +497,8 @@ class InteractiveStreamingSession:
                     causal_cross_attn=causal_cross_attn,
                     cross_attn_lookahead_sec=cross_attn_lookahead_sec,
                 )
-            else:  # full_recompute (M1)
-                chunk_iter = iter_streaming_chunks_joint(
-                    sigmas=sigmas,
-                    num_generated_latent_frames=num_generated_latent_frames,
-                    chunk_frames=chunk_frames,
-                    window_chunks=window_chunks,
-                    video_tools_full=video_tools_full,
-                    audio_tools_full=audio_tools_full,
-                    sink_latent_unpatchified=sink_latent,
-                    context_resolver=context_resolver,
-                    stepper=stepper,
-                    transformer=self._transformer,
-                    noiser=noiser,
-                    dtype=dtype,
-                    device=self.device,
-                    causal_cross_attn=causal_cross_attn,
-                    cross_attn_lookahead_sec=cross_attn_lookahead_sec,
-                )
+            else:
+                raise ValueError(f"unknown stream strategy {stream_strategy!r}")
 
             for chunk in chunk_iter:
                 update, prev_audio_len = self._emit_chunk(
