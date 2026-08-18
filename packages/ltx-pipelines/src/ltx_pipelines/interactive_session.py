@@ -375,6 +375,7 @@ class InteractiveStreamingSession:
         enhance_prompt: bool = False,
         causal_cross_attn: bool = True,
         cross_attn_lookahead_sec: float = 0.0,
+        cache_cross_attn: bool = False,
         tiling_config: TilingConfig | None = None,
         output_dir: str | None = None,
         stream_strategy: str = "kv_twin",
@@ -397,6 +398,13 @@ class InteractiveStreamingSession:
             raise ValueError(f"window_chunks must be >= 1, got {window_chunks}")
         if chunk_frames < 1:
             raise ValueError(f"chunk_frames must be >= 1, got {chunk_frames}")
+        if cache_cross_attn:
+            logger.warning(
+                "cache_cross_attn is not yet wired into the interactive streaming path "
+                "(streaming_interactive.py); ignored here. Use the CLI "
+                "(ltx_pipelines.ti2vid_streaming --cache-cross-attn) for the cached "
+                "cross-attention ablation on the kv_* strategies."
+            )
 
         # Keep inference_mode active across all yields (the generator frame persists).
         im_ctx = torch.inference_mode()

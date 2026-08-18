@@ -349,6 +349,38 @@ def _window_pe(positions: torch.Tensor, transformer, dtype: torch.dtype, *, audi
     )
 
 
+def _cross_window_pe(
+    positions: torch.Tensor, transformer, dtype: torch.dtype, *, audio: bool = False
+):
+    """Full-window *cross-attention* RoPE (cos, sin) for the KEY modality.
+
+    Mirrors ``MultiModalTransformerArgsPreprocessor.prepare``'s cross-PE path
+    (transformer_args.py:379-386): time-axis-only positions (``[:, 0:1, :]``),
+    ``inner_dim=audio_cross_attention_dim``, ``max_pos=[cross_pe_max_pos]``.
+    Built over the FULL window ``[first | history | current]`` so the cached
+    cross-attn keys (read from the a2v/v2a caches) get RoPE repositioning
+    consistent with the current chunk's ``cross_positional_embeddings`` — the
+    query cross-PE still comes from the preprocessor (current positions only),
+    only the keys need the full window.
+
+    ``audio=True`` builds audio-key cross-PE (for the a2v cache, whose keys are
+    audio) via the audio preprocessor; ``audio=False`` builds video-key cross-PE
+    (for the v2a cache) via the video preprocessor — matching which preprocessor
+    builds each modality's ``cross_positional_embeddings`` in the standard path.
+    """
+    velocity = transformer.x0.velocity_model
+    preprocessor = velocity.audio_args_preprocessor if audio else velocity.video_args_preprocessor
+    simple = preprocessor.simple_preprocessor
+    return simple._prepare_positional_embeddings(
+        positions=positions[:, 0:1, :],
+        inner_dim=preprocessor.audio_cross_attention_dim,
+        max_pos=[preprocessor.cross_pe_max_pos],
+        use_middle_indices_grid=True,
+        num_attention_heads=simple.num_attention_heads,
+        x_dtype=dtype,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Joint streaming TI2V drivers — generate BOTH video and audio causally in
 # lockstep. TI2V has no audio input: both modalities are generated. Each AR
@@ -830,6 +862,7 @@ def streaming_generate_joint_cached(  # noqa: PLR0913, PLR0915
     causal_cross_attn: bool = True,
     cross_attn_lookahead_sec: float = 0.0,
     strategy: str = "twin",
+    cache_cross_attn: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """KV-cache + RoPE repositioning joint streaming TI2V generation.
 
@@ -903,6 +936,7 @@ def streaming_generate_joint_cached(  # noqa: PLR0913, PLR0915
         audio_tokens_per_frame=1,
         strategy=strategy,
         num_steps=num_steps,
+        cache_cross_attn=cache_cross_attn,
     )
 
     # Video layout bookkeeping (frame counts; K/V live in the caches).
@@ -941,23 +975,20 @@ def streaming_generate_joint_cached(  # noqa: PLR0913, PLR0915
                     "Video window positions out of sync: "
                     f"positions={v_full_tokens}, sink+hist+cur={v_sink_t + v_hist_t + v_cur_t}."
                 )
-            v_full_window_frames = v_full_tokens // tokens_per_frame
-            v_full_frame_indices = torch.arange(v_full_window_frames, device=device).repeat_interleave(
-                tokens_per_frame
-            )
+            # Intra-chunk self-attention is full bidirectional (query_mask=None),
+            # matching the base LTX model's training (no causal self-attn mask).
+            # Chunk-level causality is structural: the window is [first | history
+            # | current] with current last, so no future chunk can leak in. The
+            # history K/V still come from the cache; only the current chunk emits
+            # queries (history query rows removed).
             if is_bootstrap:
-                # Bidirectional bootstrap: the whole [image | current] window is
-                # queried, full attention (no causal query mask).
+                # Bootstrap queries the whole [image | current] window.
                 v_query_rows = torch.arange(0, v_sink_t + v_cur_t, device=device)
-                v_query_mask = None
             else:
-                # Structured block-causal mask (history query rows removed):
-                # queries are the current chunk, keys the full window. Served by
-                # unmasked prefix attention calls (FlashAttention-capable).
+                # Steady state queries the current chunk only (history served
+                # from the cache as keys, not as queries).
                 v_query_rows = torch.arange(v_hist_t, v_hist_t + v_cur_t, device=device)
-                v_query_mask = block_causal_attention_mask(
-                    v_full_frame_indices[v_query_rows], v_full_frame_indices
-                )
+            v_query_mask = None  # full bidirectional; base-model-faithful
 
             # --- audio window positions/mask [first | history | current] (no
             # sink). The pinned audio first chunk puts the grid's head next to
@@ -977,13 +1008,8 @@ def streaming_generate_joint_cached(  # noqa: PLR0913, PLR0915
                     "Audio window positions out of sync: "
                     f"positions={a_full_tokens}, hist+cur={a_hist_t + a_cur_t}."
                 )
-            a_full_frame_indices = torch.arange(a_full_tokens, device=device)  # 1 token/frame
             a_current_rows = torch.arange(a_hist_t, a_hist_t + a_cur_t, device=device)
-            a_query_mask = (
-                None
-                if is_bootstrap
-                else block_causal_attention_mask(a_full_frame_indices[a_current_rows], a_full_frame_indices)
-            )
+            a_query_mask = None  # full bidirectional; base-model-faithful
 
             # --- video modality: [image | current] on the bootstrap (image
             # frozen, current noised), [current] afterwards (history K/V come
@@ -1029,15 +1055,29 @@ def streaming_generate_joint_cached(  # noqa: PLR0913, PLR0915
                 attention_mask=None,  # cached audio_attn1 uses query_mask via the cache
             )
 
-            if causal_cross_attn and not is_bootstrap:
-                # Cross-attn is NOT cached (only self-attn is), so the time-causal
-                # mask applies normally through the modality; set once per chunk.
-                # The bidirectional bootstrap skips it entirely.
-                a2v_mask, v2a_mask = cross_causal_attention_mask(
-                    video_state.positions, audio_state.positions, cross_attn_lookahead_sec
-                )
-                video_state = replace(video_state, cross_attention_mask=a2v_mask)
-                audio_state = replace(audio_state, cross_attention_mask=v2a_mask)
+            # Cross-attention is full bidirectional within the available tokens.
+            # By default (cache_cross_attn=False) it spans only the current
+            # chunk's video↔audio tokens (uncached, like the base LTX model).
+            # When cache_cross_attn=True, the a2v/v2a K/V are cached per chunk so
+            # the current video chunk *directly* cross-attends to [past audio |
+            # current audio] (and audio→video), full bidirectional over the cached
+            # prefix — the cross-modal analogue of how self-attn attends to the
+            # cached past. Causality is structural (window tail; no future chunk),
+            # so query_mask=None mirrors self-attn. `causal_cross_attn` /
+            # `cross_attn_lookahead_sec` stay in the signature for API stability
+            # but are no-ops on this cached path.
+            if cache_cross_attn:
+                # a2v cache keys = audio (full window); v2a cache keys = video.
+                a2v_window_pe = _cross_window_pe(a_full_positions, wrapper, dtype, audio=True)
+                v2a_window_pe = _cross_window_pe(full_positions, wrapper, dtype, audio=False)
+                a2v_query_mask = None  # full bidirectional over [audio first|hist|cur]
+                v2a_query_mask = None  # full bidirectional over [video first|hist|cur]
+                a2v_hist_len = a_hist_t
+                v2a_hist_len = v_hist_t
+            else:
+                a2v_window_pe = v2a_window_pe = None
+                a2v_query_mask = v2a_query_mask = None
+                a2v_hist_len = v2a_hist_len = 0
 
             wrapper.prepare_chunk(
                 window_pe=v_window_pe,
@@ -1046,6 +1086,12 @@ def streaming_generate_joint_cached(  # noqa: PLR0913, PLR0915
                 audio_window_pe=a_window_pe,
                 audio_query_mask=a_query_mask,
                 audio_hist_len=a_hist_t,
+                a2v_window_pe=a2v_window_pe,
+                a2v_query_mask=a2v_query_mask,
+                a2v_hist_len=a2v_hist_len,
+                v2a_window_pe=v2a_window_pe,
+                v2a_query_mask=v2a_query_mask,
+                v2a_hist_len=v2a_hist_len,
             )
 
             logger.info(

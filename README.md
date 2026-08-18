@@ -176,8 +176,9 @@ Four strategies, selectable per run (ablation):
 | `--stream-strategy` | `kv_twin` | One of `kv_twin` / `kv_clean` / `kv_noisy_steps` / `image_cond` |
 | `--window-chunks` | 1 | Sliding-window rolling-history size in AR chunks (TwinCache FIFO cap; the persistent items — video anchor `[image | chunk 1]`, audio first chunk — are not counted) |
 | `--chunk-frames` | 3 | Latent video frames generated per AR step (1 image + 3 = 4 latents per window). The causal VAE decodes the window as 1 + frames×8 pixel frames: the first latent frame (the reference image) decodes to 1 frame, every later latent frame to 8, so a 3-latent chunk yields 1 + 3×8 = 25 pixel frames (≈ 1 s at 24 fps). Each step also generates time-aligned audio frames in lockstep |
-| `--causal-cross-attn` / `--no-causal-cross-attn` | on | Time-causal mask on video↔audio cross-attention (default ON, paper-faithful; train/test mismatch on the bidirectional base model) |
+| `--causal-cross-attn` / `--no-causal-cross-attn` | on | Time-causal mask on video↔audio cross-attention. On the cached `kv_*` path this is a no-op (intra-chunk cross-attn is full bidirectional there, matching the base model); it only applies on the `image_cond` strategy and the interactive path |
 | `--cross-attn-lookahead-seconds` | 0.0 | Seconds of future audio a video frame may attend under causal cross-attn (0 = strict causal) |
+| `--cache-cross-attn` / `--no-cache-cross-attn` | off | **Ablation.** Cache the AV cross-attention K/V per chunk so the current video chunk *directly* cross-attends to `[past audio | current audio]` (and audio→video), full bidirectional over the cached prefix — the cross-modal analogue of how self-attn attends to the cached past. OFF (default) = cross-attn stays current-chunk-only (base LTX behavior). Causality is structural (window tail; no future chunk). Only affects the `kv_*` strategies; ignored by `image_cond` and the interactive path |
 
 Standard LTX-2 flags (`--seed`, `--quantization`, `--offload`, `--compile`,
 `--enhance-prompt`, `--lora`, `--prompt`, `--negative-prompt`, `--image PATH FRAME_IDX STRENGTH [CRF]`,
@@ -194,10 +195,35 @@ from the cache, RoPE reapplied with the full-window `window_pe`. Chunk 1 is a
 causal masks — and its `[image | chunk 1]` K/V is committed straight into the
 caches' permanent first slots (the never-evicted anchor; no separate sink
 block to recompute each step). Later windows are `[anchor | history | current]`
-(video) / `[first | history | current]` (audio) with block-causal query masks.
-The `strategy=` arg selects which TwinCache variant each cache uses
+(video) / `[first | history | current]` (audio); intra-chunk self-attn is full
+bidirectional (`query_mask=None`, matching the base model's training), with
+chunk-level causality structural (current is the window tail, so no future
+chunk leaks in; only the current chunk emits queries). The `strategy=` arg
+selects which TwinCache variant each cache uses
 (`kv_twin` / `kv_clean` / `kv_noisy_steps`). Production pipelines are untouched
 (`*.stream_cache` stays `None` → byte-identical standard path).
+
+#### Cross-attention ablation (`--cache-cross-attn`)
+
+By default cross-attention (video↔audio) is **uncached and current-chunk-only**:
+each chunk's video tokens cross-attend only to that chunk's audio tokens (and
+vice versa), full bidirectional — like the base LTX-2 model. Past audio reaches
+the current video only indirectly, through audio's *self-attention* cache.
+
+`--cache-cross-attn` (default off) is an ablation that adds per-chunk a2v/v2a
+cross-attention K/V caches, so the current video chunk **directly** cross-attends
+to `[past audio | current audio]` (and audio→video), full bidirectional over the
+cached prefix — the cross-modal analogue of how self-attn already attends to the
+cached past. Causality is structural (window tail; no future chunk), so no
+time-causal mask is needed. Compare the two on the cached `kv_*` strategies:
+
+```bash
+# Baseline: current-chunk-only cross-attn (base LTX behavior)
+… --stream-strategy kv_twin
+
+# Ablation: cached cross-attn (current video sees past+current audio)
+… --stream-strategy kv_twin --cache-cross-attn
+```
 
 ### Design note: why a bidirectional anchor bootstrap (not the paper's sink)
 
@@ -478,8 +504,9 @@ uv run python -m ltx_pipelines.ti2vid_streaming \
 | `--stream-strategy` | `kv_twin` | `kv_twin` / `kv_clean` / `kv_noisy_steps` / `image_cond` 之一 |
 | `--window-chunks` | 1 | 滑动窗口滚动历史大小（以 AR chunk 计；TwinCache FIFO 上限；持久项——视频锚 `[图 | chunk 1]`、音频首块——不计入） |
 | `--chunk-frames` | 3 | 每个 AR 步生成的 latent 视频帧数（1 图 + 3 = 每窗口 4 个 latent）。因果 VAE 解码窗口为 1 + 帧数×8 个像素帧：第 1 个 latent 帧（参考图像）解码为 1 帧，之后每个 latent 帧解码为 8 帧，因此 3 个 latent 的 chunk 对应 1 + 3×8 = 25 个像素帧（24 fps 下约 1 秒）。每步同时生成时间对齐的音频帧 |
-| `--causal-cross-attn` / `--no-causal-cross-attn` | 开 | 对 video↔audio 跨注意力施加时间因果掩码（默认开启，论文忠实；对双向基础模型是训练/测试不匹配） |
+| `--causal-cross-attn` / `--no-causal-cross-attn` | 开 | 对 video↔audio 跨注意力施加时间因果掩码。在缓存的 `kv_*` 路径上为 no-op（该路径的 chunk 内跨注意力已是全双向，匹配基础模型）；仅在 `image_cond` 策略和交互路径上生效 |
 | `--cross-attn-lookahead-seconds` | 0.0 | 因果跨注意力下视频帧可看到的未来音频秒数（0 = 严格因果） |
+| `--cache-cross-attn` / `--no-cache-cross-attn` | 关 | **消融。** 为每个 chunk 缓存 a2v/v2a 跨注意力 K/V，使当前视频块**直接**对 `[过去音频 | 当前音频]` 做跨注意力（音频→视频同理），在缓存前缀上全双向——即跨模态版的自注意力看过去。关（默认）= 跨注意力仅限当前块（基础 LTX 行为）。因果性是结构性的（窗口尾部；无未来 chunk）。仅作用于 `kv_*` 策略；`image_cond` 与交互路径忽略 |
 
 标准 LTX-2 参数（`--seed`、`--quantization`、`--offload`、`--compile`、`--enhance-prompt`、
 `--lora`、`--prompt`、`--negative-prompt`、`--image PATH FRAME_IDX STRENGTH [CRF]`、
@@ -490,9 +517,27 @@ uv run python -m ltx_pipelines.ti2vid_streaming \
 
 KV cache + RoPE 重定位（`streaming.py::streaming_generate_joint_cached` + `streaming_cache.py`
 + `streaming_model.py` + `attention.py`）：视频自注意力（`attn1`）**与**音频自注意力（`audio_attn1`）
-各一个 KV cache，历史 K/V 从缓存拼接，用全窗 `window_pe` 重新施加 RoPE。`kv_twin` / `kv_clean` /
-`kv_noisy_steps` 策略属 M2 族；`strategy=` 参数选择每个 cache 用哪种 TwinCache 变体。生产管线不受影响
-（`*.stream_cache` 保持 `None` → 与标准路径逐字节一致）。
+各一个 KV cache，历史 K/V 从缓存拼接，用全窗 `window_pe` 重新施加 RoPE。chunk 内自注意力为全双向
+（`query_mask=None`，匹配基础模型训练），chunk 间因果性是结构性的（当前块在窗口尾部，无未来 chunk 泄漏；
+仅当前块发出 query）。`kv_twin` / `kv_clean` / `kv_noisy_steps` 策略属 M2 族；`strategy=` 参数选择每个
+cache 用哪种 TwinCache 变体。生产管线不受影响（`*.stream_cache` 保持 `None` → 与标准路径逐字节一致）。
+
+#### 跨注意力消融（`--cache-cross-attn`）
+
+默认跨注意力（video↔audio）**不缓存、仅限当前 chunk**：每个 chunk 的视频 token 只对当前 chunk 的音频 token
+做跨注意力（反之同理），全双向——与基础 LTX-2 一致。过去的音频只能经由音频**自注意力**缓存间接影响当前视频。
+
+`--cache-cross-attn`（默认关）是一个消融选项：为每个 chunk 增加 a2v/v2a 跨注意力 K/V 缓存，使当前视频块
+**直接**对 `[过去音频 | 当前音频]` 做跨注意力（音频→视频同理），在缓存前缀上全双向——即跨模态版的自注意力看过去。
+因果性是结构性的（窗口尾部；无未来 chunk），故无需时间因果掩码。在缓存的 `kv_*` 策略上对比两者：
+
+```bash
+# 基线：仅当前 chunk 跨注意力（基础 LTX 行为）
+… --stream-strategy kv_twin
+
+# 消融：缓存跨注意力（当前视频直接看到过去+当前音频）
+… --stream-strategy kv_twin --cache-cross-attn
+```
 
 ### 设计说明：为何用双向锚 bootstrap 而非论文的 sink
 

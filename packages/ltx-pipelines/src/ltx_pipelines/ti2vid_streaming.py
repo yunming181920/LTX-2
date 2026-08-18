@@ -168,6 +168,7 @@ class TI2VidStreamingPipeline:
         stream_strategy: str = "kv_twin",
         causal_cross_attn: bool = True,
         cross_attn_lookahead_sec: float = 0.0,
+        cache_cross_attn: bool = False,
         tiling_config: TilingConfig | None = None,
         enhance_prompt: bool = False,
         sigmas: torch.Tensor | None = None,
@@ -268,6 +269,7 @@ class TI2VidStreamingPipeline:
                     causal_cross_attn=causal_cross_attn,
                     cross_attn_lookahead_sec=cross_attn_lookahead_sec,
                     strategy=_KV_STRATEGY[stream_strategy],
+                    cache_cross_attn=cache_cross_attn,
                 )
             elif stream_strategy == "image_cond":
                 from ltx_pipelines.utils.streaming import streaming_generate_joint_image_cond
@@ -359,6 +361,18 @@ def main() -> None:
         "(0.0 = strict causal). In TI2V there is no frozen 'future audio' beyond the "
         "current window, so this only relaxes causality within the visible window.",
     )
+    parser.add_argument(
+        "--cache-cross-attn",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Ablation: cache the AV cross-attention K/V per chunk so the current video "
+        "chunk directly cross-attends to [past audio | current audio] (and audio->video), "
+        "full bidirectional over the cached prefix -- the cross-modal analogue of how "
+        "self-attention attends to the cached past. Default OFF (cross-attn stays "
+        "current-chunk-only, like the base LTX model). Causality is structural (window "
+        "tail; no future chunk). Only affects the kv_* streaming strategies; ignored by "
+        "image_cond.",
+    )
     args = parser.parse_args()
 
     # Resolve the streaming strategy: --stream-strategy (explicit) wins,
@@ -391,6 +405,7 @@ def main() -> None:
         stream_strategy=stream_strategy,
         causal_cross_attn=args.causal_cross_attn,
         cross_attn_lookahead_sec=args.cross_attn_lookahead_seconds,
+        cache_cross_attn=args.cache_cross_attn,
         tiling_config=tiling_config,
         enhance_prompt=args.enhance_prompt,
     )

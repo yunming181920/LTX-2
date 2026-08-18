@@ -52,6 +52,7 @@ def _build_ui(session: InteractiveStreamingSession, default_strategy: str = "kv_
         chunk_frames: int,
         seed: int,
         causal_cross_attn: bool,
+        cache_cross_attn: bool,
         enhance_prompt: bool,
         stream_strategy: str,
     ):
@@ -74,6 +75,7 @@ def _build_ui(session: InteractiveStreamingSession, default_strategy: str = "kv_
                 chunk_frames=int(chunk_frames),
                 enhance_prompt=bool(enhance_prompt),
                 causal_cross_attn=bool(causal_cross_attn),
+                cache_cross_attn=bool(cache_cross_attn),
                 tiling_config=TileSizeConfig.default(),
                 stream_strategy=stream_strategy,
             ):
@@ -102,6 +104,13 @@ def _build_ui(session: InteractiveStreamingSession, default_strategy: str = "kv_
                 seed = gr.Slider(0, 2**31 - 1, value=0, step=1, label="Seed")
                 enhance = gr.Checkbox(value=False, label="Enhance initial prompt (Gemma)")
                 causal = gr.Checkbox(value=True, label="Causal cross-attention (AV)")
+                cache_cross = gr.Checkbox(
+                    value=False,
+                    label="Cache cross-attn (ablation)",
+                    info="Cache AV cross-attn K/V so the current chunk directly attends to past+"
+                    "current audio/video (like self-attn). OFF = current-chunk-only (base). "
+                    "CLI-only feature; ignored by the interactive path.",
+                )
                 with gr.Row():
                     start_btn = gr.Button("▶ Generate", variant="primary")
                     stop_btn = gr.Button("⏹ Stop", variant="stop")
@@ -138,7 +147,8 @@ def _build_ui(session: InteractiveStreamingSession, default_strategy: str = "kv_
             generate,
             inputs=[
                 image_in, initial_prompt, height, width, num_frames, frame_rate,
-                steps, window_chunks, chunk_frames, seed, causal, enhance, stream_strategy,
+                steps, window_chunks, chunk_frames, seed, causal, cache_cross,
+                enhance, stream_strategy,
             ],
             outputs=[video_out, audio_out, status_out],
             concurrency_limit=1,
