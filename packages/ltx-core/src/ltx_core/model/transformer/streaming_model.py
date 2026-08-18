@@ -77,12 +77,14 @@ class CausalStreamingModel(torch.nn.Module):
         audio_tokens_per_frame: int = 1,
         strategy: str = "twin",
         num_steps: int = 0,
+        cache_cross_attn: bool = False,
     ) -> None:
         super().__init__()
         self.x0 = x0_model
         self.tokens_per_frame = tokens_per_frame
         self.audio_tokens_per_frame = audio_tokens_per_frame
         self.cache_audio = cache_audio
+        self.cache_cross_attn = cache_cross_attn
         self.strategy = strategy
         self.num_steps = num_steps
         blocks = self.x0.velocity_model.transformer_blocks
@@ -124,6 +126,50 @@ class CausalStreamingModel(torch.nn.Module):
             ]
             for blk, cache in zip(blocks, self._audio_caches):
                 blk.audio_attn1.stream_cache = cache
+        # Cross-attention caches (opt-in, ``cache_cross_attn=True``): one per
+        # block's a2v (Q=video, K=audio) and v2a (Q=audio, K=video) modules.
+        # No sink (cross-attn has no image conditioning) but a persistent first
+        # chunk, mirroring the audio self-attn layout. With ``sink_tokens=0``
+        # the existing cached self-attn path (``_stream_cached_forward``)
+        # splices ``[hist | cur]`` of the *other* modality and applies key
+        # RoPE from the cache's ``window_pe`` (full-window cross-PE) and query
+        # RoPE from the passed ``pe`` (current chunk's cross-PE), so no changes
+        # to ``attention.py``/``streaming_cache.py`` are needed.
+        self._a2v_caches: list[StreamingKVCache] = []
+        self._v2a_caches: list[StreamingKVCache] = []
+        if cache_cross_attn:
+            cross_present = all(
+                hasattr(blk, "audio_to_video_attn") and hasattr(blk, "video_to_audio_attn")
+                for blk in blocks
+            )
+            if not cross_present:
+                raise ValueError(
+                    "cache_cross_attn=True requires joint video+audio transformer blocks "
+                    "(audio_to_video_attn / video_to_audio_attn); the wrapped model has none."
+                )
+            self._a2v_caches = [
+                StreamingKVCache(
+                    window_chunks,
+                    sink_tokens=0,
+                    persistent_first=True,
+                    strategy=strategy,
+                    num_steps=num_steps,
+                )
+                for _ in blocks
+            ]
+            self._v2a_caches = [
+                StreamingKVCache(
+                    window_chunks,
+                    sink_tokens=0,
+                    persistent_first=True,
+                    strategy=strategy,
+                    num_steps=num_steps,
+                )
+                for _ in blocks
+            ]
+            for blk, a2v, v2a in zip(blocks, self._a2v_caches, self._v2a_caches):
+                blk.audio_to_video_attn.stream_cache = a2v
+                blk.video_to_audio_attn.stream_cache = v2a
         # Per-chunk / per-step params (set by the driver).
         self._video_window_pe = None
         self._video_query_mask = None
@@ -131,6 +177,12 @@ class CausalStreamingModel(torch.nn.Module):
         self._audio_window_pe = None
         self._audio_query_mask = None
         self._audio_hist_len = 0
+        self._a2v_window_pe = None
+        self._a2v_query_mask = None
+        self._a2v_hist_len = 0
+        self._v2a_window_pe = None
+        self._v2a_query_mask = None
+        self._v2a_hist_len = 0
         self._mode: str = "clean"
         self._step_idx: int = 0
 
@@ -143,12 +195,22 @@ class CausalStreamingModel(torch.nn.Module):
             cache.reset()
         for cache in self._audio_caches:
             cache.reset()
+        for cache in self._a2v_caches:
+            cache.reset()
+        for cache in self._v2a_caches:
+            cache.reset()
         self._video_window_pe = None
         self._video_query_mask = None
         self._video_hist_len = 0
         self._audio_window_pe = None
         self._audio_query_mask = None
         self._audio_hist_len = 0
+        self._a2v_window_pe = None
+        self._a2v_query_mask = None
+        self._a2v_hist_len = 0
+        self._v2a_window_pe = None
+        self._v2a_query_mask = None
+        self._v2a_hist_len = 0
 
     def detach(self) -> None:
         """Reset and remove the caches from the wrapped model's attn modules.
@@ -162,6 +224,9 @@ class CausalStreamingModel(torch.nn.Module):
             blk.attn1.stream_cache = None
             if self.cache_audio:
                 blk.audio_attn1.stream_cache = None
+            if self.cache_cross_attn:
+                blk.audio_to_video_attn.stream_cache = None
+                blk.video_to_audio_attn.stream_cache = None
 
     def prepare_chunk(
         self,
@@ -172,12 +237,22 @@ class CausalStreamingModel(torch.nn.Module):
         audio_window_pe=None,
         audio_query_mask=None,
         audio_hist_len: int | None = None,
+        a2v_window_pe=None,
+        a2v_query_mask=None,
+        a2v_hist_len: int | None = None,
+        v2a_window_pe=None,
+        v2a_query_mask=None,
+        v2a_hist_len: int | None = None,
     ) -> None:
         """Set per-AR-chunk RoPE/mask params (held until the next chunk).
 
         ``window_pe``/``query_mask``/``hist_len`` are the video params; the
         ``audio_*`` params are required only when ``cache_audio=True`` and are
-        otherwise ignored (so the A2V call site is unchanged).
+        otherwise ignored (so the A2V call site is unchanged). The ``a2v_*`` /
+        ``v2a_*`` params are required only when ``cache_cross_attn=True``:
+        ``a2v_*`` configures the video-query/audio-key cross cache (window_pe
+        is the full-window audio cross-PE), ``v2a_*`` the audio-query/video-key
+        cross cache (window_pe is the full-window video cross-PE).
         """
         self._video_window_pe = window_pe
         self._video_query_mask = query_mask
@@ -188,6 +263,18 @@ class CausalStreamingModel(torch.nn.Module):
             self._audio_query_mask = audio_query_mask
         if audio_hist_len is not None:
             self._audio_hist_len = audio_hist_len
+        if a2v_window_pe is not None:
+            self._a2v_window_pe = a2v_window_pe
+        if a2v_query_mask is not None:
+            self._a2v_query_mask = a2v_query_mask
+        if a2v_hist_len is not None:
+            self._a2v_hist_len = a2v_hist_len
+        if v2a_window_pe is not None:
+            self._v2a_window_pe = v2a_window_pe
+        if v2a_query_mask is not None:
+            self._v2a_query_mask = v2a_query_mask
+        if v2a_hist_len is not None:
+            self._v2a_hist_len = v2a_hist_len
 
     def set_mode(self, mode: str, step_idx: int | None = None) -> None:
         """Select the TwinCache snapshot history reads (``"noisy"``/``"clean"``).
@@ -205,12 +292,20 @@ class CausalStreamingModel(torch.nn.Module):
             cache.stash(mode, step_idx=step_idx)
         for cache in self._audio_caches:
             cache.stash(mode, step_idx=step_idx)
+        for cache in self._a2v_caches:
+            cache.stash(mode, step_idx=step_idx)
+        for cache in self._v2a_caches:
+            cache.stash(mode, step_idx=step_idx)
 
     def commit(self) -> None:
         """Append every cache's pending TwinCache entry to its FIFO ring."""
         for cache in self._caches:
             cache.commit()
         for cache in self._audio_caches:
+            cache.commit()
+        for cache in self._a2v_caches:
+            cache.commit()
+        for cache in self._v2a_caches:
             cache.commit()
 
     def hist_len(self) -> int:
@@ -240,10 +335,32 @@ class CausalStreamingModel(torch.nn.Module):
                 tokens_per_frame=self.audio_tokens_per_frame,
                 step_idx=self._step_idx,
             )
+        for cache in self._a2v_caches:
+            cache.set_active(
+                mode=self._mode,
+                window_pe=self._a2v_window_pe,
+                query_mask=self._a2v_query_mask,
+                hist_len=self._a2v_hist_len,
+                tokens_per_frame=self.audio_tokens_per_frame,
+                step_idx=self._step_idx,
+            )
+        for cache in self._v2a_caches:
+            cache.set_active(
+                mode=self._mode,
+                window_pe=self._v2a_window_pe,
+                query_mask=self._v2a_query_mask,
+                hist_len=self._v2a_hist_len,
+                tokens_per_frame=self.tokens_per_frame,
+                step_idx=self._step_idx,
+            )
         try:
             return self.x0(video=video, audio=audio, perturbations=perturbations)
         finally:
             for cache in self._caches:
                 cache.set_inactive()
             for cache in self._audio_caches:
+                cache.set_inactive()
+            for cache in self._a2v_caches:
+                cache.set_inactive()
+            for cache in self._v2a_caches:
                 cache.set_inactive()

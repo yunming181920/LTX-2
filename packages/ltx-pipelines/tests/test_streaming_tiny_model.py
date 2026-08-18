@@ -80,7 +80,7 @@ def build_tiny() -> X0Model:
     return X0Model(model).float().eval()
 
 
-def run(x0: X0Model, num_latent_frames: int, *, strategy: str, causal_cross_attn: bool, chunk_frames: int = 1, seed: int = 0):
+def run(x0: X0Model, num_latent_frames: int, *, strategy: str, causal_cross_attn: bool, chunk_frames: int = 1, seed: int = 0, cache_cross_attn: bool = False):
     device = torch.device("cpu")
     v_shape = VideoLatentShape(1, CH, num_latent_frames, H, W)
     total_audio = int(round((num_latent_frames - 1) * 8 / FPS * 25)) + 1
@@ -107,8 +107,8 @@ def run(x0: X0Model, num_latent_frames: int, *, strategy: str, causal_cross_attn
     )
     fn, cache_strategy = _STRATEGIES[strategy]
     if cache_strategy is not None:
-        return fn(**kwargs, window_chunks=2, strategy=cache_strategy)
-    return fn(**kwargs)  # image_cond: no window_chunks
+        return fn(**kwargs, window_chunks=2, strategy=cache_strategy, cache_cross_attn=cache_cross_attn)
+    return fn(**kwargs)  # image_cond: no window_chunks, no cache_cross_attn
 
 
 def main() -> None:
@@ -169,6 +169,18 @@ def main() -> None:
             assert torch.isfinite(v).all() and torch.isfinite(a).all(), f"non-finite latents ({s})"
             assert v.shape == (1, CH, 13, H, W), f"unexpected video shape {tuple(v.shape)}"
             print(f"[phase3] {s:15s} 6-latent chunks x2:   video {tuple(v.shape)} audio {tuple(a.shape)} finite OK")
+
+        # Phase 4: cache_cross_attn=True (cross-modal KV cache) smoke. The
+        # current video chunk directly cross-attends to [past | current] audio
+        # (and audio->video) via per-chunk a2v/v2a caches; finite + shape only
+        # (an ablation path that legitimately differs from the current-only
+        # baseline). image_cond has no cross cache, so skipped.
+        for s in ("kv_twin", "kv_clean", "kv_noisy_steps"):
+            v, a = run(x0, 9, strategy=s, causal_cross_attn=True, cache_cross_attn=True)
+            assert torch.isfinite(v).all() and torch.isfinite(a).all(), f"non-finite latents ({s}, cache_cross_attn)"
+            assert v.shape == (1, CH, 9, H, W), f"unexpected video shape {tuple(v.shape)} ({s}, cache_cross_attn)"
+            print(f"[phase4] {s:15s} cache_cross_attn multi-chunk: "
+                  f"video {tuple(v.shape)} audio {tuple(a.shape)} finite OK")
 
         # Causal-VAE decode arithmetic: 249 pixel frames <-> 1 + 31*8 (32
         # latent frames; the first latent frame covers 1 pixel frame, every

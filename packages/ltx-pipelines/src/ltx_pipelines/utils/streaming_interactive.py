@@ -184,20 +184,18 @@ def iter_streaming_chunks_joint_cached(  # noqa: PLR0913, PLR0915
                     "Video window positions out of sync: "
                     f"positions={v_full_tokens}, sink+hist+cur={v_sink_t + v_hist_t + v_cur_t}."
                 )
-            v_full_window_frames = v_full_tokens // tokens_per_frame
-            v_full_frame_indices = torch.arange(v_full_window_frames, device=device).repeat_interleave(
-                tokens_per_frame
-            )
+            # Intra-chunk self-attention is full bidirectional (query_mask=None),
+            # matching the base LTX model's training (no causal self-attn mask).
+            # Chunk-level causality is structural (current is the window tail; no
+            # future chunk leaks in; only the current chunk emits queries).
             if is_bootstrap:
-                # Bidirectional bootstrap: the whole [image | current] window is
-                # queried, full attention (no causal query mask).
+                # Bootstrap queries the whole [image | current] window.
                 v_query_rows = torch.arange(0, v_sink_t + v_cur_t, device=device)
-                v_query_mask = None
             else:
+                # Steady state queries the current chunk only (history served
+                # from the cache as keys, not as queries).
                 v_query_rows = torch.arange(v_hist_t, v_hist_t + v_cur_t, device=device)
-                v_query_mask = block_causal_attention_mask(
-                    v_full_frame_indices[v_query_rows], v_full_frame_indices
-                )
+            v_query_mask = None  # full bidirectional; base-model-faithful
 
             # Audio window [first | history | current]: fresh window-relative
             # grid (pinned first chunk matches the video window's head; both
@@ -214,13 +212,8 @@ def iter_streaming_chunks_joint_cached(  # noqa: PLR0913, PLR0915
                     "Audio window positions out of sync: "
                     f"positions={a_full_tokens}, hist+cur={a_hist_t + a_cur_t}."
                 )
-            a_full_frame_indices = torch.arange(a_full_tokens, device=device)
             a_current_rows = torch.arange(a_hist_t, a_hist_t + a_cur_t, device=device)
-            a_query_mask = (
-                None
-                if is_bootstrap
-                else block_causal_attention_mask(a_full_frame_indices[a_current_rows], a_full_frame_indices)
-            )
+            a_query_mask = None  # full bidirectional; base-model-faithful
 
             # Video modality: [image | current] on the bootstrap (image
             # frozen, current noised), [current] afterwards. Noise is drawn
@@ -258,12 +251,13 @@ def iter_streaming_chunks_joint_cached(  # noqa: PLR0913, PLR0915
                 clean_latent=a_mod_clean, attention_mask=None,
             )
 
-            if causal_cross_attn and not is_bootstrap:
-                a2v_mask, v2a_mask = cross_causal_attention_mask(
-                    video_state.positions, audio_state.positions, cross_attn_lookahead_sec
-                )
-                video_state = replace(video_state, cross_attention_mask=a2v_mask)
-                audio_state = replace(audio_state, cross_attention_mask=v2a_mask)
+            # Intra-chunk cross-attention is full bidirectional
+            # (cross_attention_mask=None), matching the base LTX model's training.
+            # Cross-attn is uncached and spans only the current chunk's video↔audio
+            # tokens (no history, no future chunk), so the time-causal a2v/v2a mask
+            # was a purely intra-chunk restriction — dropped for base fidelity.
+            # `causal_cross_attn` / `cross_attn_lookahead_sec` stay in the signature
+            # for API stability but are no-ops on this cached path.
 
             wrapper.prepare_chunk(
                 window_pe=v_window_pe, query_mask=v_query_mask, hist_len=v_hist_t,
