@@ -187,6 +187,8 @@ class TI2VidStreamingPipeline:
         if chunk_frames < 1:
             raise ValueError(f"chunk_frames must be >= 1, got {chunk_frames}")
 
+        images = self.image_conditioner.resolve_crf(images)
+
         generator = torch.Generator(device=self.device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
         dtype = self.dtype
