@@ -10,3 +10,9 @@ packages/ltx-pipelines/tests/assets/*.wav filter=lfs diff=lfs merge=lfs -text
 *.jpg filter=lfs diff=lfs merge=lfs -text
 *.webp filter=lfs diff=lfs merge=lfs -text
 *.exr filter=lfs diff=lfs merge=lfs -text
+
+# The streaming ablation record is stored as plain blobs rather than LFS: GitHub
+# refuses new LFS objects on a public fork, and this repo is a fork of
+# Lightricks/LTX-2, so an LFS push of these files is rejected outright. ~12 MB.
+experiments/streaming_ablation/clips/*.mp4 !filter !diff !merge -text
+experiments/streaming_ablation/*.jpg !filter !diff !merge -text

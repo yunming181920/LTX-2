@@ -73,6 +73,14 @@ models/
 # ltx-bench Grafana dashboards (source of truth in the repo)
 !packages/ltx-bench/grafana/*.json
 
+# Streaming ablation record: the 8-cell grid's clips and contact sheets are the
+# result, so they are checked in rather than regenerated (~12 MB). Stored as plain
+# blobs, not LFS -- see .gitattributes for why.
+!experiments/streaming_ablation/clips/
+!experiments/streaming_ablation/clips/*.mp4
+!experiments/streaming_ablation/*.jpg
+!experiments/streaming_ablation/stats.json
+
 # ltx-trainer E2E test dataset (committed via Git LFS).
 # The target_audio/ and reference_audio/ subdirectories are populated lazily at test runtime
 # (high-bitrate MP3 extracted from target_videos, plus a low-bitrate MP3 reference); their
