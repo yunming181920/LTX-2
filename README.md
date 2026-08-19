@@ -247,16 +247,19 @@ prompted *“A cat lowers its head and licks its front paw …”*; chunks 2–3
    cross-attention queries also attend to the cached past (`--cache-cross-attn` on vs.
    off) has no significant effect on the generated results.
 
-Only the best configuration is shown below; the other seven runs are listed in the
-MANIFESTs of the two directories.
+The `kv_noisy_steps` results are shown below (cross-attn off). The cached
+cross-attn variants (xattn-on) look very similar — the difference is hard to
+spot by eye. All eight runs per checkpoint are listed in the MANIFESTs of the
+two directories. The clips appear as GIF previews (GitHub READMEs do not embed
+`<video>`); click one to open the original `.mp4` with audio.
 
-**LTX-2.3 · `kv_noisy_steps` · cross-attn off** (`ltx_ablate_out/videos/05_kv-noisy-steps_xattn-off.mp4`):
+**LTX-2.3 · `kv_noisy_steps` · cross-attn off**:
 
-<video src="ltx_ablate_out/videos/05_kv-noisy-steps_xattn-off.mp4"></video>
+[![LTX-2.3 · kv_noisy_steps streaming demo](ltx_ablate_out/videos/05_kv-noisy-steps_xattn-off.gif)](ltx_ablate_out/videos/05_kv-noisy-steps_xattn-off.mp4)
 
-**LTX-2.5 · `kv_noisy_steps` · cross-attn off** (`ltx25_ablate_out/videos/05_kv-noisy-steps_xattn-off.mp4`):
+**LTX-2.5 · `kv_noisy_steps` · cross-attn off**:
 
-<video src="ltx25_ablate_out/videos/05_kv-noisy-steps_xattn-off.mp4"></video>
+[![LTX-2.5 · kv_noisy_steps streaming demo](ltx25_ablate_out/videos/05_kv-noisy-steps_xattn-off.gif)](ltx25_ablate_out/videos/05_kv-noisy-steps_xattn-off.mp4)
 
 ### Design note: why a bidirectional anchor bootstrap (not the paper's sink)
 
@@ -592,15 +595,18 @@ cache 用哪种 TwinCache 变体。生产管线不受影响（`*.stream_cache` �
 3. **缓存 AV 跨注意力影响不大。** video↔audio 跨注意力的 query 是否额外 attend 到
    缓存的过去内容（`--cache-cross-attn` 开/关）对生成结果没有显著影响。
 
-下方仅展示效果最好的配置；其余 7 组结果见两个目录的 MANIFEST。
+下方展示 `kv_noisy_steps` 的结果（跨注意力关）。开启缓存跨注意力（xattn-on）的版本
+观感与之相近，肉眼不易分辨差别。每个 checkpoint 的全部 8 组结果见两个目录的
+MANIFEST。GitHub 的 README 不支持内嵌 `<video>`，故以 GIF 预览展示；点击动图可打开
+带音频的原始 `.mp4`。
 
-**LTX-2.3 · `kv_noisy_steps` · 跨注意力关**（`ltx_ablate_out/videos/05_kv-noisy-steps_xattn-off.mp4`）：
+**LTX-2.3 · `kv_noisy_steps` · 跨注意力关**：
 
-<video src="ltx_ablate_out/videos/05_kv-noisy-steps_xattn-off.mp4"></video>
+[![LTX-2.3 · kv_noisy_steps 流式演示](ltx_ablate_out/videos/05_kv-noisy-steps_xattn-off.gif)](ltx_ablate_out/videos/05_kv-noisy-steps_xattn-off.mp4)
 
-**LTX-2.5 · `kv_noisy_steps` · 跨注意力关**（`ltx25_ablate_out/videos/05_kv-noisy-steps_xattn-off.mp4`）：
+**LTX-2.5 · `kv_noisy_steps` · 跨注意力关**：
 
-<video src="ltx25_ablate_out/videos/05_kv-noisy-steps_xattn-off.mp4"></video>
+[![LTX-2.5 · kv_noisy_steps 流式演示](ltx25_ablate_out/videos/05_kv-noisy-steps_xattn-off.gif)](ltx25_ablate_out/videos/05_kv-noisy-steps_xattn-off.mp4)
 
 ### 设计说明：为何用双向锚 bootstrap 而非论文的 sink
 

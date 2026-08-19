@@ -4,11 +4,13 @@
 *.pt filter=lfs diff=lfs merge=lfs -text
 *.mp3 filter=lfs diff=lfs merge=lfs -text
 *.mp4 filter=lfs diff=lfs merge=lfs -text
-# README showcase videos: GitHub blocks new LFS uploads to public forks
-# ("can not upload new objects to public fork"), so these two small files
+# README showcase media: GitHub blocks new LFS uploads to public forks
+# ("can not upload new objects to public fork"), so these small files
 # are stored as regular Git objects instead.
 ltx_ablate_out/videos/05_kv-noisy-steps_xattn-off.mp4 -filter -diff -merge -text
 ltx25_ablate_out/videos/05_kv-noisy-steps_xattn-off.mp4 -filter -diff -merge -text
+ltx_ablate_out/videos/05_kv-noisy-steps_xattn-off.gif -filter -diff -merge -text
+ltx25_ablate_out/videos/05_kv-noisy-steps_xattn-off.gif -filter -diff -merge -text
 packages/ltx-pipelines/tests/assets/*.wav filter=lfs diff=lfs merge=lfs -text
 *.png filter=lfs diff=lfs merge=lfs -text
 *.jpeg filter=lfs diff=lfs merge=lfs -text

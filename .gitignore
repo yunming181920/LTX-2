@@ -45,9 +45,12 @@ models/
 *.wav
 *.webp
 
-# Streaming ablation showcase videos referenced from README.md (committed via Git LFS)
+# Streaming ablation showcase media referenced from README.md (regular Git
+# objects — GitHub blocks new LFS uploads to public forks)
 !ltx_ablate_out/videos/05_kv-noisy-steps_xattn-off.mp4
 !ltx25_ablate_out/videos/05_kv-noisy-steps_xattn-off.mp4
+!ltx_ablate_out/videos/05_kv-noisy-steps_xattn-off.gif
+!ltx25_ablate_out/videos/05_kv-noisy-steps_xattn-off.gif
 
 # Full-params expected results for the --full-e2e quality lane (checked in via Git LFS)
 !packages/ltx-pipelines/tests/assets/full_e2e/
