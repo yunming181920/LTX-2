@@ -374,36 +374,6 @@ checkpoint scale before trusting quality in production.
    (`--no-causal-cross-attn` to disable).
 6. **No CFG.** `--negative-prompt` is encoded but unused (single forward pass).
 
-### TODO: ComfyUI-style KV-cache VRAM management
-
-The best-performing strategy above, `kv_noisy_steps`, is also the heaviest: every
-history chunk keeps `num_steps` noisy K/V snapshots (~`num_steps/2`× the KV memory
-of `kv_twin`), and at 22B scale that hard-caps window length and step count. The
-plan is to manage the KV cache the way ComfyUI manages models — dynamically, by
-budget, instead of upfront flags like `--offload`:
-
-- **Device-state tracking.** Treat every KV entry (per block × chunk × step
-  snapshot) as a movable tensor with a `VRAM hot / CPU pinned / NVMe cold` state,
-  the way ComfyUI's model manager tracks loaded model parts.
-- **Budget-aware placement + LRU eviction.** Before each window, estimate free
-  VRAM (a soft limit); keep what fits resident, demote the rest to pinned CPU RAM,
-  evicting the least-recently-read snapshots first. The anchor (`[image | chunk 1]`)
-  and the active window stay hot; other-step snapshots of old chunks form the
-  coldest tier (each is only read at its own step).
-- **Per-block streaming.** Attention runs block by block, so only the *current
-  block's* history K/V actually needs to be resident — fetch it just before block
-  *i* runs and release it right after. GPU KV memory drops from
-  O(blocks × window × steps) to O(one block).
-- **Async prefetch on a side stream.** Overlap the next block's / next step's
-  CPU→GPU copies with the current block's compute, ComfyUI-style, so the PCIe
-  transfer is mostly hidden.
-- **Graceful degradation.** When everything stays resident the path is
-  bit-identical to today's; under pressure it degrades to CPU-spilled (optionally
-  NVMe) instead of OOMing — ComfyUI's "never crash, just slow down" philosophy.
-
-This decouples `kv_noisy_steps` quality from VRAM: window length and step count
-become bounded by time, not memory.
-
 ### Files added / changed by this fork
 
 - `packages/ltx-pipelines/src/ltx_pipelines/utils/streaming.py` — the KV-cache
@@ -715,28 +685,6 @@ uv run python packages/ltx-pipelines/tests/test_streaming_interactive.py   # 交
 5. **AV 跨模态因果掩码默认开启** —— 对双向基础模型是训练/测试不匹配，但优先论文忠实的因果性
    （`--no-causal-cross-attn` 可关闭）。
 6. **无 CFG。** `--negative-prompt` 被编码但未使用（单次前向）。
-
-### TODO：ComfyUI 式的 KV cache 显存管理
-
-上面效果最好的 `kv_noisy_steps` 同时也是显存最重的：每个 history chunk 要保存
-`num_steps` 份 noisy K/V 快照（约为 `kv_twin` 的 `num_steps/2` 倍），22B 规模下
-窗口长度与步数会被显存硬性卡死。计划按 ComfyUI 管理模型的方式来管理 KV cache ——
-按预算动态调度，而不是靠 `--offload` 这类预先开关：
-
-- **设备状态跟踪。** 把每条 KV 条目（block × chunk × step 快照）当作可迁移张量，
-  维护 `VRAM 热 / CPU 锁页 / NVMe 冷` 状态，类似 ComfyUI 模型管理器跟踪已加载部件。
-- **预算放置 + LRU 淘汰。** 每个窗口前估算空闲显存（软上限）；放得下的保持驻留，
-  其余降级到锁页 CPU 内存，最久未读的快照优先淘汰。锚（`[图 | chunk 1]`）与当前
-  窗口保持热态；旧 chunk 的其他 step 快照是最冷层（每份只在自己的 step 被读一次）。
-- **逐 block 流式。** 注意力逐 block 计算，真正需要驻留的只是*当前 block* 的
-  history K/V —— 在 block *i* 运行前取入、运行后立即释放。GPU 上的 KV 占用从
-  O(blocks × window × steps) 降到 O(单个 block)。
-- **旁路流异步预取。** 用独立 CUDA stream 把下一个 block / 下一个 step 的 CPU→GPU
-  拷贝与当前 block 的计算重叠，ComfyUI 式地把 PCIe 传输藏进计算里。
-- **优雅降级。** 显存充足时与现实现逐位一致；吃紧时降级为 CPU 溢出（可选 NVMe）
-  而不是 OOM —— 与 ComfyUI “永不崩溃、只变慢” 的思路一致。
-
-这样 `kv_noisy_steps` 的质量与显存解耦：窗口长度与步数只受时间约束，不再受显存约束。
 
 ### 本 fork 新增 / 修改的文件
 
