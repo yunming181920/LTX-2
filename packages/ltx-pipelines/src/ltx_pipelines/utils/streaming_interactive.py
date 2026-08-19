@@ -52,6 +52,7 @@ from ltx_pipelines.utils.streaming import (
     _build_audio_window_state,
     _build_window_positions,
     _build_window_state,
+    _cross_window_pe,
     _patchify_frame_latent,
     _unpatchify_audio_tokens,
     _unpatchify_tokens,
@@ -101,6 +102,7 @@ def iter_streaming_chunks_joint_cached(  # noqa: PLR0913, PLR0915
     device: torch.device,
     causal_cross_attn: bool = True,
     cross_attn_lookahead_sec: float = 0.0,
+    cache_cross_attn: bool = False,
     strategy: str = "twin",
 ) -> Iterator[StreamChunk]:
     """Interactive (live-prompt) variant of :func:`streaming_generate_joint_cached`.
@@ -147,6 +149,7 @@ def iter_streaming_chunks_joint_cached(  # noqa: PLR0913, PLR0915
         audio_tokens_per_frame=1,
         strategy=strategy,
         num_steps=num_steps,
+        cache_cross_attn=cache_cross_attn,
     )
 
     first_frames = 0
@@ -253,15 +256,32 @@ def iter_streaming_chunks_joint_cached(  # noqa: PLR0913, PLR0915
 
             # Intra-chunk cross-attention is full bidirectional
             # (cross_attention_mask=None), matching the base LTX model's training.
-            # Cross-attn is uncached and spans only the current chunk's video↔audio
-            # tokens (no history, no future chunk), so the time-causal a2v/v2a mask
-            # was a purely intra-chunk restriction — dropped for base fidelity.
-            # `causal_cross_attn` / `cross_attn_lookahead_sec` stay in the signature
-            # for API stability but are no-ops on this cached path.
+            # By default (cache_cross_attn=False) it spans only the current chunk's
+            # video↔audio tokens (uncached, no history, no future chunk), so the
+            # time-causal a2v/v2a mask was a purely intra-chunk restriction —
+            # dropped for base fidelity. With cache_cross_attn=True the a2v/v2a K/V
+            # are cached per chunk, so the current video chunk cross-attends to
+            # [past audio | current audio] (and audio→video) over the cached prefix.
+            # Causality stays structural (window tail), so query_mask=None mirrors
+            # self-attn. `causal_cross_attn` / `cross_attn_lookahead_sec` stay in the
+            # signature for API stability but are no-ops on this cached path.
+            if cache_cross_attn:
+                a2v_window_pe = _cross_window_pe(a_full_positions, wrapper, dtype, audio=True)
+                v2a_window_pe = _cross_window_pe(full_positions, wrapper, dtype, audio=False)
+                a2v_query_mask = None  # full bidirectional over [audio first|hist|cur]
+                v2a_query_mask = None  # full bidirectional over [video first|hist|cur]
+                a2v_hist_len = a_hist_t
+                v2a_hist_len = v_hist_t
+            else:
+                a2v_window_pe = v2a_window_pe = None
+                a2v_query_mask = v2a_query_mask = None
+                a2v_hist_len = v2a_hist_len = 0
 
             wrapper.prepare_chunk(
                 window_pe=v_window_pe, query_mask=v_query_mask, hist_len=v_hist_t,
                 audio_window_pe=a_window_pe, audio_query_mask=a_query_mask, audio_hist_len=a_hist_t,
+                a2v_window_pe=a2v_window_pe, a2v_query_mask=a2v_query_mask, a2v_hist_len=a2v_hist_len,
+                v2a_window_pe=v2a_window_pe, v2a_query_mask=v2a_query_mask, v2a_hist_len=v2a_hist_len,
             )
 
             logger.info(

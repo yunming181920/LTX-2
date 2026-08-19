@@ -178,7 +178,7 @@ Four strategies, selectable per run (ablation):
 | `--chunk-frames` | 3 | Latent video frames generated per AR step (1 image + 3 = 4 latents per window). The causal VAE decodes the window as 1 + frames×8 pixel frames: the first latent frame (the reference image) decodes to 1 frame, every later latent frame to 8, so a 3-latent chunk yields 1 + 3×8 = 25 pixel frames (≈ 1 s at 24 fps). Each step also generates time-aligned audio frames in lockstep |
 | `--causal-cross-attn` / `--no-causal-cross-attn` | on | Time-causal mask on video↔audio cross-attention. On the cached `kv_*` path this is a no-op (intra-chunk cross-attn is full bidirectional there, matching the base model); it only applies on the `image_cond` strategy and the interactive path |
 | `--cross-attn-lookahead-seconds` | 0.0 | Seconds of future audio a video frame may attend under causal cross-attn (0 = strict causal) |
-| `--cache-cross-attn` / `--no-cache-cross-attn` | off | **Ablation.** Cache the AV cross-attention K/V per chunk so the current video chunk *directly* cross-attends to `[past audio | current audio]` (and audio→video), full bidirectional over the cached prefix — the cross-modal analogue of how self-attn attends to the cached past. OFF (default) = cross-attn stays current-chunk-only (base LTX behavior). Causality is structural (window tail; no future chunk). Only affects the `kv_*` strategies; ignored by `image_cond` and the interactive path |
+| `--cache-cross-attn` / `--no-cache-cross-attn` | off | **Ablation.** Cache the AV cross-attention K/V per chunk so the current video chunk *directly* cross-attends to `[past audio | current audio]` (and audio→video), full bidirectional over the cached prefix — the cross-modal analogue of how self-attn attends to the cached past. OFF (default) = cross-attn stays current-chunk-only (base LTX behavior). Causality is structural (window tail; no future chunk). Only affects the `kv_*` strategies (offline and interactive alike); ignored by `image_cond`, which keeps no attention history |
 
 Standard LTX-2 flags (`--seed`, `--quantization`, `--offload`, `--compile`,
 `--enhance-prompt`, `--lora`, `--prompt`, `--negative-prompt`, `--image PATH FRAME_IDX STRENGTH [CRF]`,
@@ -309,6 +309,7 @@ Checkpoint-free CPU tests cover the streaming plumbing and all four strategies:
 uv run python packages/ltx-pipelines/tests/test_streaming_joint.py          # pure-tensor helpers
 uv run python packages/ltx-pipelines/tests/test_streaming_tiny_model.py     # tiny model: 4-strategy parity + finiteness
 uv run python packages/ltx-pipelines/tests/test_streaming_interactive.py   # interactive: 4-strategy parity + finiteness
+uv run python packages/ltx-pipelines/tests/test_streaming_interactive_cross_attn.py  # interactive --cache-cross-attn semantics
 ```
 
 `test_streaming_tiny_model.py` asserts single-chunk parity across the three KV
@@ -317,8 +318,14 @@ with `image_cond` checked for finiteness (its all-causal rotating-sink path
 legitimately differs on chunk 1), plus multi-chunk finiteness;
 `test_streaming_interactive.py` does the same for the Gradio/interactive
 driver, plus constant-context parity against the offline driver, the
-live-prompt swap guarantee and the resolver call-count. Smoke-test at
-checkpoint scale before trusting quality in production.
+live-prompt swap guarantee and the resolver call-count.
+`test_streaming_interactive_cross_attn.py` covers `cache_cross_attn` on the
+interactive driver: a no-op with a single chunk (no history to read), a real
+effect once history exists, and bit-exact agreement with the offline driver
+either way. That last phase is the one that catches a half-wired flag — the
+a2v/v2a caches are allocated in the `CausalStreamingModel` constructor, so
+supplying only `prepare_chunk`'s window RoPE leaves the option silently inert.
+Smoke-test at checkpoint scale before trusting quality in production.
 
 ### Known limitations vs. the paper
 
@@ -366,6 +373,9 @@ checkpoint scale before trusting quality in production.
   attr + `_stream_cached_forward` (sink-less layouts for both modalities; strategy-agnostic).
 - `packages/ltx-pipelines/tests/test_streaming_{joint,tiny_model,interactive}.py` —
   pure-tensor / tiny-model / interactive tests covering all four strategies.
+- `packages/ltx-pipelines/tests/test_streaming_interactive_cross_attn.py` —
+  `cache_cross_attn` semantics on the interactive driver (no-op without history,
+  effective with it, bit-exact against the offline driver).
 
 ### Upstream LTX-2
 
@@ -506,7 +516,7 @@ uv run python -m ltx_pipelines.ti2vid_streaming \
 | `--chunk-frames` | 3 | 每个 AR 步生成的 latent 视频帧数（1 图 + 3 = 每窗口 4 个 latent）。因果 VAE 解码窗口为 1 + 帧数×8 个像素帧：第 1 个 latent 帧（参考图像）解码为 1 帧，之后每个 latent 帧解码为 8 帧，因此 3 个 latent 的 chunk 对应 1 + 3×8 = 25 个像素帧（24 fps 下约 1 秒）。每步同时生成时间对齐的音频帧 |
 | `--causal-cross-attn` / `--no-causal-cross-attn` | 开 | 对 video↔audio 跨注意力施加时间因果掩码。在缓存的 `kv_*` 路径上为 no-op（该路径的 chunk 内跨注意力已是全双向，匹配基础模型）；仅在 `image_cond` 策略和交互路径上生效 |
 | `--cross-attn-lookahead-seconds` | 0.0 | 因果跨注意力下视频帧可看到的未来音频秒数（0 = 严格因果） |
-| `--cache-cross-attn` / `--no-cache-cross-attn` | 关 | **消融。** 为每个 chunk 缓存 a2v/v2a 跨注意力 K/V，使当前视频块**直接**对 `[过去音频 | 当前音频]` 做跨注意力（音频→视频同理），在缓存前缀上全双向——即跨模态版的自注意力看过去。关（默认）= 跨注意力仅限当前块（基础 LTX 行为）。因果性是结构性的（窗口尾部；无未来 chunk）。仅作用于 `kv_*` 策略；`image_cond` 与交互路径忽略 |
+| `--cache-cross-attn` / `--no-cache-cross-attn` | 关 | **消融。** 为每个 chunk 缓存 a2v/v2a 跨注意力 K/V，使当前视频块**直接**对 `[过去音频 | 当前音频]` 做跨注意力（音频→视频同理），在缓存前缀上全双向——即跨模态版的自注意力看过去。关（默认）= 跨注意力仅限当前块（基础 LTX 行为）。因果性是结构性的（窗口尾部；无未来 chunk）。仅作用于 `kv_*` 策略（离线与交互路径均支持）；`image_cond` 无注意力历史，忽略该选项 |
 
 标准 LTX-2 参数（`--seed`、`--quantization`、`--offload`、`--compile`、`--enhance-prompt`、
 `--lora`、`--prompt`、`--negative-prompt`、`--image PATH FRAME_IDX STRENGTH [CRF]`、
@@ -603,11 +613,15 @@ live prompt 即可。`--host/--port/--share` 控制服务；`--device` / `--text
 uv run python packages/ltx-pipelines/tests/test_streaming_joint.py          # 纯张量 helper
 uv run python packages/ltx-pipelines/tests/test_streaming_tiny_model.py     # 微型模型：4 策略 parity + finiteness
 uv run python packages/ltx-pipelines/tests/test_streaming_interactive.py   # 交互：4 策略 parity + finiteness
+uv run python packages/ltx-pipelines/tests/test_streaming_interactive_cross_attn.py  # 交互路径 --cache-cross-attn 语义
 ```
 
 `test_streaming_tiny_model.py` 断言四种策略单 chunk 逐位一致（无 history ⇒ 等价）+ 多 chunk finiteness；
 `test_streaming_interactive.py` 对交互/Gradio 驱动做同样校验（外加 live-prompt 改写保证与 resolver 调用次数）。
-生产环境信任 M2 前请在 GPU 上跑一遍。
+`test_streaming_interactive_cross_attn.py` 校验交互路径上的 `cache_cross_attn`：单 chunk 时逐位无变化（没有
+history 可读）、有 history 后必须产生差异、且两种取值下都与离线 driver 逐位一致。最后一项用于捕获"只补一半"
+的接线错误——a2v/v2a 缓存是在 `CausalStreamingModel` 构造函数里分配的，只给 `prepare_chunk` 传 window RoPE
+会让该选项静默失效。生产环境信任 M2 前请在 GPU 上跑一遍。
 
 ### 相对论文的不足
 
