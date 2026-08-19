@@ -178,7 +178,7 @@ Four strategies, selectable per run (ablation):
 | `--chunk-frames` | 3 | Latent video frames generated per AR step (1 image + 3 = 4 latents per window). The causal VAE decodes the window as 1 + frames×8 pixel frames: the first latent frame (the reference image) decodes to 1 frame, every later latent frame to 8, so a 3-latent chunk yields 1 + 3×8 = 25 pixel frames (≈ 1 s at 24 fps). Each step also generates time-aligned audio frames in lockstep |
 | `--causal-cross-attn` / `--no-causal-cross-attn` | on | Time-causal mask on video↔audio cross-attention. On the cached `kv_*` path this is a no-op (intra-chunk cross-attn is full bidirectional there, matching the base model); it only applies on the `image_cond` strategy and the interactive path |
 | `--cross-attn-lookahead-seconds` | 0.0 | Seconds of future audio a video frame may attend under causal cross-attn (0 = strict causal) |
-| `--cache-cross-attn` / `--no-cache-cross-attn` | off | **Ablation.** Cache the AV cross-attention K/V per chunk so the current video chunk *directly* cross-attends to `[past audio | current audio]` (and audio→video), full bidirectional over the cached prefix — the cross-modal analogue of how self-attn attends to the cached past. OFF (default) = cross-attn stays current-chunk-only (base LTX behavior). Causality is structural (window tail; no future chunk). Only affects the `kv_*` strategies; ignored by `image_cond` and the interactive path |
+| `--cache-cross-attn` / `--no-cache-cross-attn` | off | **Ablation.** Cache the AV cross-attention K/V per chunk so the current video chunk *directly* cross-attends to `[past audio | current audio]` (and audio→video), full bidirectional over the cached prefix — the cross-modal analogue of how self-attn attends to the cached past. OFF (default) = cross-attn stays current-chunk-only (base LTX behavior). Causality is structural (window tail; no future chunk). Only affects the `kv_*` strategies; ignored by `image_cond`. Honored on both the CLI (`ti2vid_streaming`) and the interactive path (`InteractiveStreamingSession.run` / the Gradio app). |
 
 Standard LTX-2 flags (`--seed`, `--quantization`, `--offload`, `--compile`,
 `--enhance-prompt`, `--lora`, `--prompt`, `--negative-prompt`, `--image PATH FRAME_IDX STRENGTH [CRF]`,
@@ -224,6 +224,39 @@ time-causal mask is needed. Compare the two on the cached `kv_*` strategies:
 # Ablation: cached cross-attn (current video sees past+current audio)
 … --stream-strategy kv_twin --cache-cross-attn
 ```
+
+### Ablation results (4 strategies × cross-attn caching)
+
+All eight runs per checkpoint (4 strategies × `--cache-cross-attn` on/off) are in
+[`ltx_ablate_out/`](ltx_ablate_out/MANIFEST.md) (LTX-2.3) and
+[`ltx25_ablate_out/`](ltx25_ablate_out/MANIFEST.md) (LTX-2.5, distilled DiT):
+512×768, 97 frames (4 chunks, ≈4.04 s), 8 steps, bf16, seed 42. Chunks 0–1 are
+prompted *“A cat lowers its head and licks its front paw …”*; chunks 2–3 switch to
+*“looks directly at the camera …”* (subject dropped — a live-prompt interaction test).
+
+**Findings**
+
+1. **Same-timestep (noise-level-matched) history reads work best.** `kv_noisy_steps`
+   — step *t* reads the history's own step-*t* noisy snapshot — is the best of the four
+   strategies overall: on LTX-2.3 the stream stays visually clean across all chunks, and
+   on LTX-2.5 only a slight distortion remains.
+2. **Every other strategy distorts.** `kv_twin` (mid-step noisy + final-step clean),
+   `kv_clean` (always-clean reads) and `image_cond` (no KV history, rotating last-frame
+   conditioning) all produce visible distortion in the later chunks.
+3. **Cached AV cross-attention makes little difference.** Whether the video↔audio
+   cross-attention queries also attend to the cached past (`--cache-cross-attn` on vs.
+   off) has no significant effect on the generated results.
+
+Only the best configuration is shown below; the other seven runs are listed in the
+MANIFESTs of the two directories.
+
+**LTX-2.3 · `kv_noisy_steps` · cross-attn off** (`ltx_ablate_out/videos/05_kv-noisy-steps_xattn-off.mp4`):
+
+<video src="ltx_ablate_out/videos/05_kv-noisy-steps_xattn-off.mp4"></video>
+
+**LTX-2.5 · `kv_noisy_steps` · cross-attn off** (`ltx25_ablate_out/videos/05_kv-noisy-steps_xattn-off.mp4`):
+
+<video src="ltx25_ablate_out/videos/05_kv-noisy-steps_xattn-off.mp4"></video>
 
 ### Design note: why a bidirectional anchor bootstrap (not the paper's sink)
 
@@ -340,6 +373,36 @@ checkpoint scale before trusting quality in production.
    the bidirectional base model, but preferred for paper-faithful causality
    (`--no-causal-cross-attn` to disable).
 6. **No CFG.** `--negative-prompt` is encoded but unused (single forward pass).
+
+### TODO: ComfyUI-style KV-cache VRAM management
+
+The best-performing strategy above, `kv_noisy_steps`, is also the heaviest: every
+history chunk keeps `num_steps` noisy K/V snapshots (~`num_steps/2`× the KV memory
+of `kv_twin`), and at 22B scale that hard-caps window length and step count. The
+plan is to manage the KV cache the way ComfyUI manages models — dynamically, by
+budget, instead of upfront flags like `--offload`:
+
+- **Device-state tracking.** Treat every KV entry (per block × chunk × step
+  snapshot) as a movable tensor with a `VRAM hot / CPU pinned / NVMe cold` state,
+  the way ComfyUI's model manager tracks loaded model parts.
+- **Budget-aware placement + LRU eviction.** Before each window, estimate free
+  VRAM (a soft limit); keep what fits resident, demote the rest to pinned CPU RAM,
+  evicting the least-recently-read snapshots first. The anchor (`[image | chunk 1]`)
+  and the active window stay hot; other-step snapshots of old chunks form the
+  coldest tier (each is only read at its own step).
+- **Per-block streaming.** Attention runs block by block, so only the *current
+  block's* history K/V actually needs to be resident — fetch it just before block
+  *i* runs and release it right after. GPU KV memory drops from
+  O(blocks × window × steps) to O(one block).
+- **Async prefetch on a side stream.** Overlap the next block's / next step's
+  CPU→GPU copies with the current block's compute, ComfyUI-style, so the PCIe
+  transfer is mostly hidden.
+- **Graceful degradation.** When everything stays resident the path is
+  bit-identical to today's; under pressure it degrades to CPU-spilled (optionally
+  NVMe) instead of OOMing — ComfyUI's "never crash, just slow down" philosophy.
+
+This decouples `kv_noisy_steps` quality from VRAM: window length and step count
+become bounded by time, not memory.
 
 ### Files added / changed by this fork
 
@@ -506,7 +569,7 @@ uv run python -m ltx_pipelines.ti2vid_streaming \
 | `--chunk-frames` | 3 | 每个 AR 步生成的 latent 视频帧数（1 图 + 3 = 每窗口 4 个 latent）。因果 VAE 解码窗口为 1 + 帧数×8 个像素帧：第 1 个 latent 帧（参考图像）解码为 1 帧，之后每个 latent 帧解码为 8 帧，因此 3 个 latent 的 chunk 对应 1 + 3×8 = 25 个像素帧（24 fps 下约 1 秒）。每步同时生成时间对齐的音频帧 |
 | `--causal-cross-attn` / `--no-causal-cross-attn` | 开 | 对 video↔audio 跨注意力施加时间因果掩码。在缓存的 `kv_*` 路径上为 no-op（该路径的 chunk 内跨注意力已是全双向，匹配基础模型）；仅在 `image_cond` 策略和交互路径上生效 |
 | `--cross-attn-lookahead-seconds` | 0.0 | 因果跨注意力下视频帧可看到的未来音频秒数（0 = 严格因果） |
-| `--cache-cross-attn` / `--no-cache-cross-attn` | 关 | **消融。** 为每个 chunk 缓存 a2v/v2a 跨注意力 K/V，使当前视频块**直接**对 `[过去音频 | 当前音频]` 做跨注意力（音频→视频同理），在缓存前缀上全双向——即跨模态版的自注意力看过去。关（默认）= 跨注意力仅限当前块（基础 LTX 行为）。因果性是结构性的（窗口尾部；无未来 chunk）。仅作用于 `kv_*` 策略；`image_cond` 与交互路径忽略 |
+| `--cache-cross-attn` / `--no-cache-cross-attn` | 关 | **消融。** 为每个 chunk 缓存 a2v/v2a 跨注意力 K/V，使当前视频块**直接**对 `[过去音频 | 当前音频]` 做跨注意力（音频→视频同理），在缓存前缀上全双向——即跨模态版的自注意力看过去。关（默认）= 跨注意力仅限当前块（基础 LTX 行为）。因果性是结构性的（窗口尾部；无未来 chunk）。仅作用于 `kv_*` 策略；`image_cond` 忽略。CLI（`ti2vid_streaming`）与交互路径（`InteractiveStreamingSession.run` / Gradio app）均生效。 |
 
 标准 LTX-2 参数（`--seed`、`--quantization`、`--offload`、`--compile`、`--enhance-prompt`、
 `--lora`、`--prompt`、`--negative-prompt`、`--image PATH FRAME_IDX STRENGTH [CRF]`、
@@ -538,6 +601,36 @@ cache 用哪种 TwinCache 变体。生产管线不受影响（`*.stream_cache` �
 # 消融：缓存跨注意力（当前视频直接看到过去+当前音频）
 … --stream-strategy kv_twin --cache-cross-attn
 ```
+
+### 消融结果（4 策略 × 跨注意力缓存）
+
+每个 checkpoint 各 8 次运行（4 策略 × `--cache-cross-attn` 开/关），完整结果在
+[`ltx_ablate_out/`](ltx_ablate_out/MANIFEST.md)（LTX-2.3）与
+[`ltx25_ablate_out/`](ltx25_ablate_out/MANIFEST.md)（LTX-2.5，蒸馏 DiT）：
+512×768，97 帧（4 个 chunk，约 4.04 秒），8 步，bf16，seed 42。chunk 0–1 的提示词为
+*“A cat lowers its head and licks its front paw …”*；chunk 2–3 切换为
+*“looks directly at the camera …”*（去掉主语，作为实时提示词交互测试）。
+
+**结论**
+
+1. **同 timestep（噪声级别匹配）的 history 读取效果最好。** `kv_noisy_steps`
+   —— 步 *t* 读取 history 自身步 *t* 的 noisy 快照 —— 是四种策略中整体最好的：
+   在 LTX-2.3 上全程画面基本无畸变；在 LTX-2.5 上也仅剩轻微畸变。
+2. **其余策略均会畸变。** `kv_twin`（中间步 noisy + 末步 clean）、`kv_clean`
+   （全程 clean 读取）与 `image_cond`（无 KV history、旋转末帧条件）在后续 chunk
+   中均出现可见畸变。
+3. **缓存 AV 跨注意力影响不大。** video↔audio 跨注意力的 query 是否额外 attend 到
+   缓存的过去内容（`--cache-cross-attn` 开/关）对生成结果没有显著影响。
+
+下方仅展示效果最好的配置；其余 7 组结果见两个目录的 MANIFEST。
+
+**LTX-2.3 · `kv_noisy_steps` · 跨注意力关**（`ltx_ablate_out/videos/05_kv-noisy-steps_xattn-off.mp4`）：
+
+<video src="ltx_ablate_out/videos/05_kv-noisy-steps_xattn-off.mp4"></video>
+
+**LTX-2.5 · `kv_noisy_steps` · 跨注意力关**（`ltx25_ablate_out/videos/05_kv-noisy-steps_xattn-off.mp4`）：
+
+<video src="ltx25_ablate_out/videos/05_kv-noisy-steps_xattn-off.mp4"></video>
 
 ### 设计说明：为何用双向锚 bootstrap 而非论文的 sink
 
@@ -622,6 +715,28 @@ uv run python packages/ltx-pipelines/tests/test_streaming_interactive.py   # 交
 5. **AV 跨模态因果掩码默认开启** —— 对双向基础模型是训练/测试不匹配，但优先论文忠实的因果性
    （`--no-causal-cross-attn` 可关闭）。
 6. **无 CFG。** `--negative-prompt` 被编码但未使用（单次前向）。
+
+### TODO：ComfyUI 式的 KV cache 显存管理
+
+上面效果最好的 `kv_noisy_steps` 同时也是显存最重的：每个 history chunk 要保存
+`num_steps` 份 noisy K/V 快照（约为 `kv_twin` 的 `num_steps/2` 倍），22B 规模下
+窗口长度与步数会被显存硬性卡死。计划按 ComfyUI 管理模型的方式来管理 KV cache ——
+按预算动态调度，而不是靠 `--offload` 这类预先开关：
+
+- **设备状态跟踪。** 把每条 KV 条目（block × chunk × step 快照）当作可迁移张量，
+  维护 `VRAM 热 / CPU 锁页 / NVMe 冷` 状态，类似 ComfyUI 模型管理器跟踪已加载部件。
+- **预算放置 + LRU 淘汰。** 每个窗口前估算空闲显存（软上限）；放得下的保持驻留，
+  其余降级到锁页 CPU 内存，最久未读的快照优先淘汰。锚（`[图 | chunk 1]`）与当前
+  窗口保持热态；旧 chunk 的其他 step 快照是最冷层（每份只在自己的 step 被读一次）。
+- **逐 block 流式。** 注意力逐 block 计算，真正需要驻留的只是*当前 block* 的
+  history K/V —— 在 block *i* 运行前取入、运行后立即释放。GPU 上的 KV 占用从
+  O(blocks × window × steps) 降到 O(单个 block)。
+- **旁路流异步预取。** 用独立 CUDA stream 把下一个 block / 下一个 step 的 CPU→GPU
+  拷贝与当前 block 的计算重叠，ComfyUI 式地把 PCIe 传输藏进计算里。
+- **优雅降级。** 显存充足时与现实现逐位一致；吃紧时降级为 CPU 溢出（可选 NVMe）
+  而不是 OOM —— 与 ComfyUI “永不崩溃、只变慢” 的思路一致。
+
+这样 `kv_noisy_steps` 的质量与显存解耦：窗口长度与步数只受时间约束，不再受显存约束。
 
 ### 本 fork 新增 / 修改的文件
 

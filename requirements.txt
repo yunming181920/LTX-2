@@ -1,0 +1,53 @@
+# LTX-2.3 deployment — conda env `ltx2` (python 3.11)
+# -------------------------------------------------------------------------
+# CUDA 13.0 build (cu130). Chosen because:
+#   * the host driver is 580.105.08, whose max supported CUDA is 13.0 — cu130
+#     sits exactly at the ceiling, so no CUDA-13 minor-version-compat gamble;
+#   * the repo's pinned cu132 (CUDA 13.2) wheels route their PEP658 .metadata
+#     through download-r2.pytorch.org, which the corp proxy 503s; cu130 metadata
+#     is served directly by download.pytorch.org (no R2);
+#   * the highest torch+torchaudio MATCHING pair on cu130 is 2.11.0/2.11.0
+#     (cu130 has no torchaudio 2.12/2.13). torch~=2.7 (ltx-core floor) is happy.
+# torch/torchaudio wheels are served directly by the aliyun mirror (no R2
+# redirect), which the proxy allows.
+--find-links https://mirrors.aliyun.com/pytorch-wheels/cu130/
+--index-url https://mirrors.aliyun.com/pypi/simple/
+--trusted-host mirrors.aliyun.com
+
+torch==2.11.0+cu130
+torchaudio==2.11.0+cu130
+# torchvision pairs with torch 2.11 (0.26.0). Required only for LTX-2.5 (gemma4
+# multimodal text encoder's processing_gemma4 imports torchvision). 2.3/gemma3
+# does not need it. Must be --no-deps + the cu130 find-links so pip does not pull
+# a mismatched torch.
+torchvision==0.26.0+cu130
+
+# --- ltx-core runtime deps (packages/ltx-core/pyproject.toml) ---
+einops
+numpy
+av
+safetensors
+accelerate
+scipy>=1.14
+# transformers: ltx-core pins >=5.8.0,<5.15 (5.15 breaks the Gemma text encoder)
+transformers>=5.8.0,<5.15
+
+# --- ltx-pipelines runtime deps (packages/ltx-pipelines/pyproject.toml) ---
+tqdm
+pillow
+openimageio
+cloudpickle>=3.1
+gradio>=4.0
+
+# --- NOT installed (intentional) ---
+# natten: its only prebuilt wheel is natten==0.21.7+torch2130cu132 (cu132, and
+#   whl.natten.org is unreachable through the proxy). LTX falls back to
+#   triton/eager, which torch 2.11 ships (triton 3.6.0) — functional, slower VAE.
+# ltx-kernels: FP8/FP6 GEMM + multi-GPU all2all; needs a CUDA toolchain + host
+#   build. Skip unless you need those kernels.
+
+# --- workspace packages (editable) ---
+# torch is already satisfied by the lines above, so the uv_build backend will
+# not pull a CPU torch from PyPI during metadata resolution.
+-e packages/ltx-core
+-e packages/ltx-pipelines

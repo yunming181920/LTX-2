@@ -56,6 +56,7 @@ from ltx_pipelines.utils.streaming import (
     _unpatchify_audio_tokens,
     _unpatchify_tokens,
     _window_pe,
+    _cross_window_pe,
     block_causal_attention_mask,
     cross_causal_attention_mask,
 )
@@ -102,6 +103,7 @@ def iter_streaming_chunks_joint_cached(  # noqa: PLR0913, PLR0915
     causal_cross_attn: bool = True,
     cross_attn_lookahead_sec: float = 0.0,
     strategy: str = "twin",
+    cache_cross_attn: bool = False,
 ) -> Iterator[StreamChunk]:
     """Interactive (live-prompt) variant of :func:`streaming_generate_joint_cached`.
 
@@ -147,6 +149,7 @@ def iter_streaming_chunks_joint_cached(  # noqa: PLR0913, PLR0915
         audio_tokens_per_frame=1,
         strategy=strategy,
         num_steps=num_steps,
+        cache_cross_attn=cache_cross_attn,
     )
 
     first_frames = 0
@@ -259,9 +262,30 @@ def iter_streaming_chunks_joint_cached(  # noqa: PLR0913, PLR0915
             # `causal_cross_attn` / `cross_attn_lookahead_sec` stay in the signature
             # for API stability but are no-ops on this cached path.
 
+            # Cross-attention cache (opt-in, mirrors the offline driver). When
+            # cache_cross_attn=True the a2v (Q=video,K=audio) and v2a
+            # (Q=audio,K=video) K/V are cached per chunk so the current chunk
+            # cross-attends over [past | current] of the key modality, full
+            # bidirectional over the cached prefix (query_mask=None). Causality is
+            # structural (current is the window tail; no future chunk).
+            if cache_cross_attn:
+                # a2v cache keys = audio (full window); v2a cache keys = video.
+                a2v_window_pe = _cross_window_pe(a_full_positions, wrapper, dtype, audio=True)
+                v2a_window_pe = _cross_window_pe(full_positions, wrapper, dtype, audio=False)
+                a2v_query_mask = None  # full bidirectional over [audio first|hist|cur]
+                v2a_query_mask = None  # full bidirectional over [video first|hist|cur]
+                a2v_hist_len = a_hist_t
+                v2a_hist_len = v_hist_t
+            else:
+                a2v_window_pe = v2a_window_pe = None
+                a2v_query_mask = v2a_query_mask = None
+                a2v_hist_len = v2a_hist_len = 0
+
             wrapper.prepare_chunk(
                 window_pe=v_window_pe, query_mask=v_query_mask, hist_len=v_hist_t,
                 audio_window_pe=a_window_pe, audio_query_mask=a_query_mask, audio_hist_len=a_hist_t,
+                a2v_window_pe=a2v_window_pe, a2v_query_mask=a2v_query_mask, a2v_hist_len=a2v_hist_len,
+                v2a_window_pe=v2a_window_pe, v2a_query_mask=v2a_query_mask, v2a_hist_len=v2a_hist_len,
             )
 
             logger.info(
@@ -359,6 +383,7 @@ def iter_streaming_chunks_joint_image_cond(  # noqa: PLR0913, PLR0915
     device: torch.device,
     causal_cross_attn: bool = True,
     cross_attn_lookahead_sec: float = 0.0,
+    sink_rotator: Callable[[torch.Tensor], torch.Tensor] | None = None,
 ) -> Iterator[StreamChunk]:
     """Interactive (live-prompt) variant of :func:`streaming_generate_joint_image_cond`.
 
@@ -452,7 +477,17 @@ def iter_streaming_chunks_joint_image_cond(  # noqa: PLR0913, PLR0915
         )
         f0 = 1 + frames_generated_before
         full_video_latent[:, :, f0 : f0 + current_video_frames, :, :] = video_clean_unpatchified
-        sink_tokens = video_clean_tokens[:, -tokens_per_frame:, :].clone()
+        if sink_rotator is not None:
+            # Pixel-frame rotation: decode this chunk's last latent frame -> pixel,
+            # re-run the image-conditioning pipeline (CRF + VAE encode) on it, and
+            # use that re-encoded latent as the next chunk's image-reference sink.
+            last_latent_frame = video_clean_unpatchified[:, :, -1:, :, :]
+            rotated_sink = sink_rotator(last_latent_frame)
+            sink_tokens = _patchify_frame_latent(rotated_sink, patchifier)
+            if sink_tokens.shape[1] != tokens_per_frame:
+                sink_tokens = sink_tokens[:, :tokens_per_frame, :].contiguous()
+        else:
+            sink_tokens = video_clean_tokens[:, -tokens_per_frame:, :].clone()
 
         ac0, ac1 = audio_current_range
         audio_clean_tokens = audio_state.latent[:, ac0:ac1, :].clone()

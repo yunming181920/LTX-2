@@ -109,7 +109,7 @@ def _build_ui(session: InteractiveStreamingSession, default_strategy: str = "kv_
                     label="Cache cross-attn (ablation)",
                     info="Cache AV cross-attn K/V so the current chunk directly attends to past+"
                     "current audio/video (like self-attn). OFF = current-chunk-only (base). "
-                    "CLI-only feature; ignored by the interactive path.",
+                    "Affects kv_* strategies; ignored by image_cond.",
                 )
                 with gr.Row():
                     start_btn = gr.Button("▶ Generate", variant="primary")

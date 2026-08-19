@@ -398,12 +398,11 @@ class InteractiveStreamingSession:
             raise ValueError(f"window_chunks must be >= 1, got {window_chunks}")
         if chunk_frames < 1:
             raise ValueError(f"chunk_frames must be >= 1, got {chunk_frames}")
-        if cache_cross_attn:
+        if cache_cross_attn and stream_strategy == "image_cond":
             logger.warning(
-                "cache_cross_attn is not yet wired into the interactive streaming path "
-                "(streaming_interactive.py); ignored here. Use the CLI "
-                "(ltx_pipelines.ti2vid_streaming --cache-cross-attn) for the cached "
-                "cross-attention ablation on the kv_* strategies."
+                "cache_cross_attn has no effect on the image_cond strategy "
+                "(no KV cross-attn caches; conditioning is the rotating image sink). "
+                "Ignoring for this run."
             )
 
         # Keep inference_mode active across all yields (the generator frame persists).
@@ -487,6 +486,7 @@ class InteractiveStreamingSession:
                     causal_cross_attn=causal_cross_attn,
                     cross_attn_lookahead_sec=cross_attn_lookahead_sec,
                     strategy=_KV_STRATEGY[stream_strategy],
+                    cache_cross_attn=cache_cross_attn,
                 )
             elif stream_strategy == "image_cond":
                 chunk_iter = iter_streaming_chunks_joint_image_cond(

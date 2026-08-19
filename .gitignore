@@ -45,6 +45,10 @@ models/
 *.wav
 *.webp
 
+# Streaming ablation showcase videos referenced from README.md (committed via Git LFS)
+!ltx_ablate_out/videos/05_kv-noisy-steps_xattn-off.mp4
+!ltx25_ablate_out/videos/05_kv-noisy-steps_xattn-off.mp4
+
 # Full-params expected results for the --full-e2e quality lane (checked in via Git LFS)
 !packages/ltx-pipelines/tests/assets/full_e2e/
 !packages/ltx-pipelines/tests/assets/full_e2e/*.mp4
