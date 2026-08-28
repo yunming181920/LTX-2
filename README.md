@@ -15,20 +15,6 @@
 
 ---
 
-## ✍️ Author's Notes / 作者见解
-
-**English.** Both **Vidu S1** and **Wan Streamer 0.3** implement this kind of
-interactive (streaming, memory-based) video generation. My guess is that
-**Wan Streamer 0.3**'s condition injection uses embeddings produced by a
-**Qwen3.5-Omni** multimodal model, whereas **Vidu S1** may condition on a
-multimodal model — or possibly on pure text. 
-
-**中文.** **Vidu S1** 和 **Wan Streamer 0.3** 都实现了这种交互式（带记忆的流式）视频生成。
-我猜测 **Wan Streamer 0.3** 的 condition 注入可能是用 **Qwen3.5-Omni** 多模态模型得到的 embedding，
-而 **Vidu S1** 使用的可能是多模态模型，也可能是纯文本。
-
----
-
 ## English
 
 ### What this is
